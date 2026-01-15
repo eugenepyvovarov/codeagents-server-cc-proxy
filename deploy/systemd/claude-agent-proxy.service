@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Agent SSE Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=claudeproxy
+WorkingDirectory=/opt/claude-proxy
+EnvironmentFile=/etc/claude-proxy.env
+ExecStart=/opt/claude-proxy/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+

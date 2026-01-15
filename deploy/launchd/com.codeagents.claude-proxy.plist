@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.codeagents.claude-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__INSTALL_DIR__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>uvicorn</string>
+    <string>app:app</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8787</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__INSTALL_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>UserName</key>
+  <string>root</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__BREW_PREFIX__/bin:__BREW_PREFIX__/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/claude-proxy.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/claude-proxy.err.log</string>
+</dict>
+</plist>

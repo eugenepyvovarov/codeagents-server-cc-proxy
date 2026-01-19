@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_update_interval_seconds() -> int:
-    raw = os.environ.get("CLAUDE_PROXY_UPDATE_INTERVAL_SECONDS", "21600")
+    raw = os.environ.get("CLAUDE_PROXY_UPDATE_INTERVAL_SECONDS", "600")
     try:
         return int(raw)
     except ValueError:

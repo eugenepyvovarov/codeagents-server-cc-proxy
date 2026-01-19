@@ -376,10 +376,22 @@ class ConversationManager:
     def _build_options(self, body: dict[str, Any]) -> ClaudeAgentOptions:
         kwargs: dict[str, Any] = {}
 
+        project_claude_dir: Path | None = None
+        project_settings_path: Path | None = None
+        project_mcp_path: Path | None = None
+        project_skills_dir: Path | None = None
         if isinstance(body.get("cwd"), str):
             kwargs["cwd"] = body["cwd"]
+            cwd_path = Path(body["cwd"]).expanduser().resolve()
+            project_claude_dir = cwd_path / ".claude"
+            project_settings_path = project_claude_dir / "settings.json"
+            project_mcp_path = project_claude_dir / "mcp.json"
+            project_skills_dir = project_claude_dir / "skills"
+
+        allowed_tools = None
         if isinstance(body.get("allowed_tools"), list):
-            kwargs["allowed_tools"] = body["allowed_tools"]
+            allowed_tools = body["allowed_tools"]
+            kwargs["allowed_tools"] = allowed_tools
         if body.get("system_prompt") is not None:
             kwargs["system_prompt"] = body["system_prompt"]
         if body.get("max_turns") is not None:
@@ -394,6 +406,42 @@ class ConversationManager:
             kwargs["model"] = body["model"]
         if body.get("permission_mode") is not None:
             kwargs["permission_mode"] = body["permission_mode"]
+
+        if body.get("settings") is not None:
+            kwargs["settings"] = body["settings"]
+        elif project_settings_path and project_settings_path.is_file():
+            kwargs["settings"] = str(project_settings_path)
+
+        if body.get("setting_sources") is not None:
+            kwargs["setting_sources"] = body["setting_sources"]
+        else:
+            user_skills_dir = Path.home() / ".claude" / "skills"
+            should_load_settings = False
+            if project_settings_path and project_settings_path.is_file():
+                should_load_settings = True
+            if project_mcp_path and project_mcp_path.is_file():
+                should_load_settings = True
+            if project_skills_dir and project_skills_dir.is_dir():
+                should_load_settings = True
+            if user_skills_dir.is_dir():
+                should_load_settings = True
+            if should_load_settings:
+                kwargs["setting_sources"] = ["user", "project"]
+
+        if body.get("mcp_servers") is None and project_mcp_path and project_mcp_path.is_file():
+            kwargs["mcp_servers"] = str(project_mcp_path)
+
+        if allowed_tools is not None:
+            has_skill_tool = "Skill" in allowed_tools
+            if not has_skill_tool:
+                if project_skills_dir and project_skills_dir.is_dir():
+                    allowed_tools.append("Skill")
+                    kwargs["allowed_tools"] = allowed_tools
+                else:
+                    user_skills_dir = Path.home() / ".claude" / "skills"
+                    if user_skills_dir.is_dir():
+                        allowed_tools.append("Skill")
+                        kwargs["allowed_tools"] = allowed_tools
 
         return ClaudeAgentOptions(**kwargs)
 

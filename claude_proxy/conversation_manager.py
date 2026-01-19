@@ -81,6 +81,13 @@ class ConversationManager:
     def new_conversation_id(self) -> str:
         return uuid.uuid4().hex
 
+    async def has_active_runs(self) -> bool:
+        async with self._cwd_lock:
+            if self._active_run_by_cwd:
+                return True
+        async with self._conversations_lock:
+            return any(conv.is_running for conv in self._conversations.values())
+
     def _dir_for(self, conversation_id: str) -> Path:
         return self._conversations_dir / conversation_id
 

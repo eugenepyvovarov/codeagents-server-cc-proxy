@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +18,110 @@ from claude_proxy.conversation_manager import (
 )
 from claude_proxy.util import parse_int, sanitize_id
 
+logger = logging.getLogger(__name__)
+
+
+def _get_update_interval_seconds() -> int:
+    raw = os.environ.get("CLAUDE_PROXY_UPDATE_INTERVAL_SECONDS", "21600")
+    try:
+        return int(raw)
+    except ValueError:
+        return 21600
+
+
+def _run_command(args: list[str], *, cwd: Path) -> str:
+    return subprocess.check_output(args, cwd=str(cwd), text=True).strip()
+
+
+def _default_branch(repo_dir: Path) -> str:
+    try:
+        output = _run_command(
+            ["git", "-C", str(repo_dir), "ls-remote", "--symref", "origin", "HEAD"],
+            cwd=repo_dir,
+        )
+        for line in output.splitlines():
+            if line.startswith("ref:"):
+                ref = line.split()[1]
+                if ref.startswith("refs/heads/"):
+                    return ref.replace("refs/heads/", "")
+    except Exception:
+        logger.warning("Auto-update: failed to detect default branch")
+    return "main"
+
+
+def _install_requirements(repo_dir: Path) -> None:
+    venv_python = repo_dir / ".venv" / "bin" / "python"
+    requirements = repo_dir / "requirements.txt"
+    if not venv_python.exists() or not requirements.is_file():
+        logger.warning("Auto-update: missing venv or requirements.txt, skipping pip install")
+        return
+    subprocess.check_call(
+        [str(venv_python), "-m", "pip", "install", "-r", str(requirements)],
+        cwd=str(repo_dir),
+    )
+
+
+def _apply_repo_update(repo_dir: Path) -> bool:
+    if not (repo_dir / ".git").exists():
+        logger.warning("Auto-update: repo not found, skipping")
+        return False
+
+    branch = _default_branch(repo_dir)
+    subprocess.check_call(["git", "-C", str(repo_dir), "fetch", "--prune", "origin"])
+    local_sha = _run_command(["git", "-C", str(repo_dir), "rev-parse", "HEAD"], cwd=repo_dir)
+    remote_ref = f"origin/{branch}"
+    remote_sha = _run_command(["git", "-C", str(repo_dir), "rev-parse", remote_ref], cwd=repo_dir)
+
+    if local_sha == remote_sha:
+        return False
+
+    logger.info("Auto-update: applying %s -> %s", local_sha, remote_sha)
+    subprocess.check_call(["git", "-C", str(repo_dir), "reset", "--hard", remote_ref])
+    _install_requirements(repo_dir)
+    return True
+
 
 def create_app(*, store_dir: Path | None = None, backend=default_backend) -> FastAPI:
     app = FastAPI()
     manager = ConversationManager(store_dir=store_dir, backend=backend)
+    update_lock = asyncio.Lock()
+    update_task: asyncio.Task[None] | None = None
+
+    async def _maybe_update() -> None:
+        if update_lock.locked():
+            return
+        async with update_lock:
+            if await manager.has_active_runs():
+                logger.info("Auto-update: skipping because a run is active")
+                return
+            repo_dir = Path(__file__).resolve().parent
+            try:
+                updated = await asyncio.to_thread(_apply_repo_update, repo_dir)
+            except Exception:
+                logger.exception("Auto-update: failed")
+                return
+            if updated:
+                logger.info("Auto-update: applied; restarting process")
+                os._exit(0)
+
+    async def _auto_update_loop() -> None:
+        interval = _get_update_interval_seconds()
+        if interval <= 0:
+            logger.info("Auto-update: disabled")
+            return
+        while True:
+            await asyncio.sleep(interval)
+            await _maybe_update()
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        nonlocal update_task
+        update_task = asyncio.create_task(_auto_update_loop())
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        if update_task:
+            update_task.cancel()
 
     def json_error(status_code: int, *, error: str, **extra: Any) -> JSONResponse:
         return JSONResponse(status_code=status_code, content={"error": error, **extra})

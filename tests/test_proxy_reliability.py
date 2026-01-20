@@ -155,7 +155,7 @@ async def test_agent_folder_lock(tmp_path):
             json={"conversation_id": "c2", "cwd": "/tmp", "text": "hello2"},
         )
         assert busy.status_code == 409
-        assert busy.json().get("error") == "agent_folder_busy"
+        assert busy.json().get("error") == "conversation_already_running"
 
 
 @pytest.mark.asyncio

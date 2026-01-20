@@ -78,6 +78,11 @@ class ConversationManager:
         self._active_run_by_cwd: dict[str, str] = {}
         self._cwd_lock = asyncio.Lock()
 
+        self._cwd_index: dict[str, str] = {}
+        self._alias_index: dict[str, str] = {}
+        self._cwd_index_lock = asyncio.Lock()
+        self._prime_cwd_index()
+
     def new_conversation_id(self) -> str:
         return uuid.uuid4().hex
 
@@ -95,6 +100,48 @@ class ConversationManager:
         conversation_dir = self._dir_for(conversation_id)
         return conversation_dir, conversation_dir / "meta.json", conversation_dir / "events.ndjson"
 
+    def _normalize_cwd(self, cwd: str) -> str:
+        return cwd.strip()
+
+    def _prime_cwd_index(self) -> None:
+        if not self._conversations_dir.exists():
+            return
+
+        cwd_candidates: dict[str, tuple[str, float]] = {}
+        cwd_conversations: dict[str, list[str]] = {}
+
+        for meta_path in self._conversations_dir.glob("*/meta.json"):
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            conversation_id = payload.get("conversation_id")
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                continue
+
+            cwd_value = payload.get("cwd")
+            if isinstance(cwd_value, str) and cwd_value.strip():
+                cwd = self._normalize_cwd(cwd_value)
+                cwd_conversations.setdefault(cwd, []).append(conversation_id)
+
+                try:
+                    mtime = meta_path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+
+                existing = cwd_candidates.get(cwd)
+                if existing is None or mtime > existing[1]:
+                    cwd_candidates[cwd] = (conversation_id, mtime)
+            else:
+                self._alias_index[conversation_id] = conversation_id
+
+        for cwd, (canonical_id, _) in cwd_candidates.items():
+            self._cwd_index[cwd] = canonical_id
+            for conv_id in cwd_conversations.get(cwd, []):
+                self._alias_index[conv_id] = canonical_id
+            self._alias_index[canonical_id] = canonical_id
+
     async def conversation_exists(self, conversation_id: str) -> bool:
         async with self._conversations_lock:
             if conversation_id in self._conversations:
@@ -103,6 +150,7 @@ class ConversationManager:
         return conversation_dir.exists()
 
     async def get_or_create_conversation(self, conversation_id: str) -> _Conversation:
+        conv: _Conversation
         async with self._conversations_lock:
             existing = self._conversations.get(conversation_id)
             if existing is not None:
@@ -119,7 +167,67 @@ class ConversationManager:
 
             await asyncio.to_thread(self._load_from_disk, conv)
             self._conversations[conversation_id] = conv
-            return conv
+
+        await self._register_conversation_id(conversation_id=conv.conversation_id, cwd=conv.cwd)
+        return conv
+
+    async def resolve_conversation_id(self, *, conversation_id: str, cwd: str | None) -> str:
+        conversation_id = conversation_id.strip()
+        if not conversation_id:
+            raise ValueError("conversation_id must be a non-empty string.")
+
+        async with self._cwd_index_lock:
+            canonical = self._alias_index.get(conversation_id)
+        if canonical:
+            return canonical
+
+        if cwd is None or not cwd.strip():
+            return conversation_id
+
+        normalized_cwd = self._normalize_cwd(cwd)
+
+        if await self.conversation_exists(conversation_id):
+            conv = await self.get_or_create_conversation(conversation_id)
+            async with conv.lock:
+                existing_cwd = conv.cwd
+            if existing_cwd and self._normalize_cwd(existing_cwd) != normalized_cwd:
+                raise ConversationCwdMismatchError(
+                    conversation_id=conversation_id,
+                    expected_cwd=existing_cwd,
+                    got_cwd=cwd,
+                )
+
+        canonical = await self._register_conversation_id(conversation_id=conversation_id, cwd=normalized_cwd)
+        return canonical or conversation_id
+
+    async def resolve_existing_conversation_id(
+        self,
+        *,
+        conversation_id: str,
+        cwd: str | None = None,
+    ) -> str | None:
+        conversation_id = conversation_id.strip()
+        if not conversation_id:
+            return None
+
+        async with self._cwd_index_lock:
+            canonical = self._alias_index.get(conversation_id)
+            cwd_match = self._cwd_index.get(self._normalize_cwd(cwd)) if cwd and cwd.strip() else None
+
+            if canonical:
+                return canonical
+            if cwd_match:
+                self._alias_index[conversation_id] = cwd_match
+                return cwd_match
+
+        if await self.conversation_exists(conversation_id):
+            conv = await self.get_or_create_conversation(conversation_id)
+            async with conv.lock:
+                cwd_value = conv.cwd
+            await self._register_conversation_id(conversation_id=conv.conversation_id, cwd=cwd_value)
+            return conversation_id
+
+        return None
 
     async def ensure_cwd_binding(self, *, conversation_id: str, cwd: str) -> None:
         cwd = cwd.strip()
@@ -131,6 +239,7 @@ class ConversationManager:
             if conv.cwd is None:
                 conv.cwd = cwd
                 await asyncio.to_thread(self._write_meta, conv)
+                await self._register_conversation_id(conversation_id=conv.conversation_id, cwd=conv.cwd)
             elif conv.cwd != cwd:
                 raise ConversationCwdMismatchError(
                     conversation_id=conversation_id,
@@ -481,6 +590,28 @@ class ConversationManager:
         tmp_path = conv.meta_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(conv.meta_path)
+
+    async def _register_conversation_id(self, *, conversation_id: str, cwd: str | None) -> str | None:
+        conversation_id = conversation_id.strip()
+        if not conversation_id:
+            return None
+
+        if cwd is None or not str(cwd).strip():
+            async with self._cwd_index_lock:
+                self._alias_index[conversation_id] = conversation_id
+            return conversation_id
+
+        normalized_cwd = self._normalize_cwd(cwd)
+        async with self._cwd_index_lock:
+            canonical = self._cwd_index.get(normalized_cwd)
+            if canonical is None:
+                canonical = conversation_id
+                self._cwd_index[normalized_cwd] = canonical
+
+            self._alias_index[conversation_id] = canonical
+            self._alias_index[canonical] = canonical
+
+        return canonical
 
 
 def _now_iso() -> str:

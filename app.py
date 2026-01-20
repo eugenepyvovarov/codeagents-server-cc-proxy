@@ -154,12 +154,26 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if since is None:
             return json_error(400, error="bad_request", message="Invalid Last-Event-ID header.")
 
+        cwd_value = body.get("cwd")
+        cwd = cwd_value if isinstance(cwd_value, str) else None
+        try:
+            conversation_id = await manager.resolve_conversation_id(conversation_id=conversation_id, cwd=cwd)
+        except ConversationCwdMismatchError as exc:
+            return json_error(
+                409,
+                error="conversation_cwd_mismatch",
+                conversation_id=conversation_id,
+                expected_cwd=exc.expected_cwd,
+                got_cwd=exc.got_cwd,
+            )
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
         conversation = await manager.get_or_create_conversation(conversation_id)
 
         if conversation.is_running:
             if prompt is not None and prompt != conversation.prompt:
                 return json_error(409, error="conversation_already_running", conversation_id=conversation_id)
-            cwd_value = body.get("cwd")
             if not isinstance(cwd_value, str):
                 return json_error(400, error="bad_request", message="cwd is required to attach.")
             try:
@@ -213,8 +227,11 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if since is None:
             return json_error(400, error="bad_request", message="Invalid since parameter.")
 
-        if not await manager.conversation_exists(conversation_id):
+        cwd = request.query_params.get("cwd")
+        resolved = await manager.resolve_existing_conversation_id(conversation_id=conversation_id, cwd=cwd)
+        if resolved is None:
             return json_error(404, error="conversation_unknown", conversation_id=conversation_id)
+        conversation_id = resolved
 
         async def iter_ndjson():
             async for line in manager.iter_ndjson(conversation_id=conversation_id, since=since):

@@ -4,11 +4,12 @@ import asyncio
 import logging
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from claude_proxy.backends import default_backend
 from claude_proxy.conversation_manager import (
@@ -61,6 +62,18 @@ def _install_requirements(repo_dir: Path) -> None:
     )
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _git_sha(repo_dir: Path) -> str:
+    try:
+        return _run_command(["git", "-C", str(repo_dir), "rev-parse", "--short", "HEAD"], cwd=repo_dir)
+    except Exception:
+        logger.warning("Failed to read git SHA for proxy version")
+    return "unknown"
+
+
 def _apply_repo_update(repo_dir: Path) -> bool:
     if not (repo_dir / ".git").exists():
         logger.warning("Auto-update: repo not found, skipping")
@@ -86,6 +99,18 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     manager = ConversationManager(store_dir=store_dir, backend=backend)
     update_lock = asyncio.Lock()
     update_task: asyncio.Task[None] | None = None
+    repo_dir = Path(__file__).resolve().parent
+    version = _git_sha(repo_dir)
+    started_at = _now_iso()
+
+    def proxy_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+        headers = {
+            "X-Proxy-Version": version,
+            "X-Proxy-Started-At": started_at,
+        }
+        if extra:
+            headers.update(extra)
+        return headers
 
     async def _maybe_update() -> None:
         if update_lock.locked():
@@ -124,11 +149,19 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             update_task.cancel()
 
     def json_error(status_code: int, *, error: str, **extra: Any) -> JSONResponse:
-        return JSONResponse(status_code=status_code, content={"error": error, **extra})
+        return JSONResponse(
+            status_code=status_code,
+            content={"error": error, **extra},
+            headers=proxy_headers(),
+        )
 
     @app.get("/healthz")
-    async def healthz() -> PlainTextResponse:
-        return PlainTextResponse("ok")
+    async def healthz() -> JSONResponse:
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ok", "version": version, "started_at": started_at},
+            headers=proxy_headers(),
+        )
 
     @app.post("/v1/agent/stream")
     async def agent_stream(request: Request) -> StreamingResponse:
@@ -149,6 +182,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             conversation_id = sanitize_id(conversation_id)
         except ValueError as exc:
             return json_error(400, error="bad_request", message=str(exc))
+        incoming_conversation_id = conversation_id
 
         since = parse_int(request.headers.get("Last-Event-ID"), default=0)
         if since is None:
@@ -170,6 +204,20 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return json_error(400, error="bad_request", message=str(exc))
 
         conversation = await manager.get_or_create_conversation(conversation_id)
+        await manager.log_cwd_event(
+            cwd=cwd or conversation.cwd,
+            event="stream",
+            payload={
+                "incoming_conversation_id": incoming_conversation_id,
+                "resolved_conversation_id": conversation_id,
+                "alias_used": incoming_conversation_id != conversation_id,
+                "since": since,
+                "has_prompt": bool(prompt),
+                "is_running": conversation.is_running,
+            },
+            version=version,
+            started_at=started_at,
+        )
 
         if conversation.is_running:
             if prompt is not None and prompt != conversation.prompt:
@@ -210,11 +258,13 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         return StreamingResponse(
             stream,
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=proxy_headers(
+                {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                }
+            ),
         )
 
     @app.get("/v1/conversations/{conversation_id}/events")
@@ -223,6 +273,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             conversation_id = sanitize_id(conversation_id)
         except ValueError as exc:
             return json_error(400, error="bad_request", message=str(exc))
+        incoming_conversation_id = conversation_id
         since = parse_int(request.query_params.get("since"), default=0)
         if since is None:
             return json_error(400, error="bad_request", message="Invalid since parameter.")
@@ -232,6 +283,20 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if resolved is None:
             return json_error(404, error="conversation_unknown", conversation_id=conversation_id)
         conversation_id = resolved
+        conversation = await manager.get_or_create_conversation(conversation_id)
+        await manager.log_cwd_event(
+            cwd=cwd or conversation.cwd,
+            event="replay",
+            payload={
+                "incoming_conversation_id": incoming_conversation_id,
+                "resolved_conversation_id": resolved,
+                "alias_used": incoming_conversation_id != resolved,
+                "since": since,
+                "cwd_param_provided": bool(cwd),
+            },
+            version=version,
+            started_at=started_at,
+        )
 
         async def iter_ndjson():
             async for line in manager.iter_ndjson(conversation_id=conversation_id, since=since):
@@ -240,9 +305,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         return StreamingResponse(
             iter_ndjson(),
             media_type="application/x-ndjson",
-            headers={
-                "Cache-Control": "no-cache",
-            },
+            headers=proxy_headers({"Cache-Control": "no-cache"}),
         )
 
     return app

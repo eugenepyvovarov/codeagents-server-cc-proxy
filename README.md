@@ -31,6 +31,11 @@ Health check:
 curl -s http://127.0.0.1:8787/healthz
 ```
 
+Returns JSON with `status`, `version`, and `started_at`. All responses also include
+`X-Proxy-Version` and `X-Proxy-Started-At` headers.
+
+Proxy logs per folder are written to `data/logs/<sha1(cwd)>.log` (JSONL).
+
 ## API
 
 ### Start/attach stream

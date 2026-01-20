@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -101,7 +102,13 @@ class ConversationManager:
         return conversation_dir, conversation_dir / "meta.json", conversation_dir / "events.ndjson"
 
     def _normalize_cwd(self, cwd: str) -> str:
-        return cwd.strip()
+        trimmed = cwd.strip()
+        if not trimmed:
+            return ""
+        try:
+            return str(Path(trimmed).expanduser().resolve(strict=False))
+        except Exception:
+            return trimmed
 
     def _prime_cwd_index(self) -> None:
         if not self._conversations_dir.exists():
@@ -230,7 +237,7 @@ class ConversationManager:
         return None
 
     async def ensure_cwd_binding(self, *, conversation_id: str, cwd: str) -> None:
-        cwd = cwd.strip()
+        cwd = self._normalize_cwd(cwd)
         if not cwd:
             raise ValueError("cwd must be a non-empty string.")
 
@@ -352,7 +359,7 @@ class ConversationManager:
 
         cwd = payload.get("cwd")
         if isinstance(cwd, str) and cwd.strip():
-            conv.cwd = cwd
+            conv.cwd = self._normalize_cwd(cwd)
 
         claude_session_id = payload.get("claude_session_id")
         if isinstance(claude_session_id, str) and claude_session_id.strip():
@@ -590,6 +597,47 @@ class ConversationManager:
         tmp_path = conv.meta_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         tmp_path.replace(conv.meta_path)
+
+    async def log_cwd_event(
+        self,
+        *,
+        cwd: str | None,
+        event: str,
+        payload: dict[str, Any],
+        version: str | None = None,
+        started_at: str | None = None,
+    ) -> None:
+        if cwd is None:
+            return
+
+        normalized_cwd = self._normalize_cwd(cwd)
+        if not normalized_cwd:
+            return
+
+        digest = hashlib.sha1(normalized_cwd.encode("utf-8")).hexdigest()
+        log_dir = self._store_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / f"{digest}.log"
+
+        record = {
+            "timestamp": _now_iso(),
+            "event": event,
+            "cwd": normalized_cwd,
+            "cwd_hash": digest,
+            **payload,
+        }
+        if version:
+            record["version"] = version
+        if started_at:
+            record["started_at"] = started_at
+
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        await asyncio.to_thread(self._append_log_line, path, line)
+
+    @staticmethod
+    def _append_log_line(path: Path, line: str) -> None:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
 
     async def _register_conversation_id(self, *, conversation_id: str, cwd: str | None) -> str | None:
         conversation_id = conversation_id.strip()

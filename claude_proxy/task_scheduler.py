@@ -865,11 +865,23 @@ class TaskScheduler:
         request_body.setdefault("cwd", task.cwd)
         if task.conversation_group:
             request_body.setdefault("conversation_group", task.conversation_group)
+        conversation_id = await self._resolve_task_conversation_id(task)
         return await self._manager.start_run(
-            conversation_id=task.conversation_id,
+            conversation_id=conversation_id,
             prompt=task.prompt,
             request_body=request_body,
         )
+
+    async def _resolve_task_conversation_id(self, task: TaskRecord) -> str:
+        try:
+            return await self._manager.resolve_conversation_id(
+                conversation_id=task.conversation_id,
+                cwd=task.cwd,
+                conversation_group=task.conversation_group,
+            )
+        except Exception as exc:
+            logger.warning("Task %s conversation resolution failed: %s", task.id, exc)
+            return task.conversation_id
 
     async def _enqueue_pending(self, task: TaskRecord, scheduled_at: datetime) -> None:
         pending = PendingRun(

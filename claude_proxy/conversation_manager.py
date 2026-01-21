@@ -144,8 +144,7 @@ class ConversationManager:
 
         cwd_candidates: dict[str, tuple[str, float]] = {}
         cwd_conversations: dict[str, list[str]] = {}
-        group_candidates: dict[tuple[str, str], tuple[str, float]] = {}
-        group_conversations: dict[tuple[str, str], list[str]] = {}
+        group_keys: set[tuple[str, str]] = set()
 
         for meta_path in self._conversations_dir.glob("*/meta.json"):
             try:
@@ -167,17 +166,13 @@ class ConversationManager:
                 except OSError:
                     mtime = 0.0
 
+                cwd_conversations.setdefault(cwd, []).append(conversation_id)
+                existing = cwd_candidates.get(cwd)
+                if existing is None or mtime > existing[1]:
+                    cwd_candidates[cwd] = (conversation_id, mtime)
+
                 if group:
-                    key = (cwd, group)
-                    group_conversations.setdefault(key, []).append(conversation_id)
-                    existing = group_candidates.get(key)
-                    if existing is None or mtime > existing[1]:
-                        group_candidates[key] = (conversation_id, mtime)
-                else:
-                    cwd_conversations.setdefault(cwd, []).append(conversation_id)
-                    existing = cwd_candidates.get(cwd)
-                    if existing is None or mtime > existing[1]:
-                        cwd_candidates[cwd] = (conversation_id, mtime)
+                    group_keys.add((cwd, group))
             else:
                 self._alias_index[conversation_id] = conversation_id
 
@@ -187,11 +182,11 @@ class ConversationManager:
                 self._alias_index[conv_id] = canonical_id
             self._alias_index[canonical_id] = canonical_id
 
-        for key, (canonical_id, _) in group_candidates.items():
-            self._group_index[key] = canonical_id
-            for conv_id in group_conversations.get(key, []):
-                self._alias_index[conv_id] = canonical_id
-            self._alias_index[canonical_id] = canonical_id
+        for key in group_keys:
+            cwd, _group = key
+            canonical_id = self._cwd_index.get(cwd)
+            if canonical_id:
+                self._group_index[key] = canonical_id
 
     async def conversation_exists(self, conversation_id: str) -> bool:
         async with self._conversations_lock:
@@ -237,18 +232,10 @@ class ConversationManager:
         if not conversation_id:
             raise ValueError("conversation_id must be a non-empty string.")
 
-        async with self._cwd_index_lock:
-            canonical = self._alias_index.get(conversation_id)
-        if canonical:
-            return canonical
-
-        if cwd is None or not cwd.strip():
-            return conversation_id
-
-        normalized_cwd = self._normalize_cwd(cwd)
         normalized_group = self._normalize_conversation_group(conversation_group)
+        normalized_cwd = self._normalize_cwd(cwd) if cwd and cwd.strip() else None
 
-        if await self.conversation_exists(conversation_id):
+        if normalized_cwd and await self.conversation_exists(conversation_id):
             conv = await self.get_or_create_conversation(conversation_id)
             async with conv.lock:
                 existing_cwd = conv.cwd
@@ -258,6 +245,24 @@ class ConversationManager:
                     expected_cwd=existing_cwd,
                     got_cwd=cwd,
                 )
+
+        if normalized_cwd:
+            async with self._cwd_index_lock:
+                canonical = self._cwd_index.get(normalized_cwd)
+                if canonical:
+                    self._alias_index[conversation_id] = canonical
+                    self._alias_index[canonical] = canonical
+                    if normalized_group:
+                        self._group_index[(normalized_cwd, normalized_group)] = canonical
+                    return canonical
+
+        async with self._cwd_index_lock:
+            canonical = self._alias_index.get(conversation_id)
+        if canonical:
+            return canonical
+
+        if normalized_cwd is None:
+            return conversation_id
 
         canonical = await self._register_conversation_id(
             conversation_id=conversation_id,
@@ -278,36 +283,40 @@ class ConversationManager:
             return None
 
         normalized_group = self._normalize_conversation_group(conversation_group)
+        normalized_cwd = self._normalize_cwd(cwd) if cwd and cwd.strip() else None
+
+        if normalized_cwd and await self.conversation_exists(conversation_id):
+            conv = await self.get_or_create_conversation(conversation_id)
+            async with conv.lock:
+                existing_cwd = conv.cwd
+            if existing_cwd and self._normalize_cwd(existing_cwd) != normalized_cwd:
+                return None
+
         async with self._cwd_index_lock:
-            canonical = self._alias_index.get(conversation_id)
-
-            if canonical:
-                return canonical
-
-            if normalized_group and cwd and cwd.strip():
-                group_key = self._group_key(cwd=cwd, group=normalized_group)
-                group_match = self._group_index.get(group_key)
-                if group_match:
-                    self._alias_index[conversation_id] = group_match
-                    return group_match
-
-            if cwd and cwd.strip():
-                cwd_match = self._cwd_index.get(self._normalize_cwd(cwd))
+            if normalized_cwd:
+                cwd_match = self._cwd_index.get(normalized_cwd)
                 if cwd_match:
                     self._alias_index[conversation_id] = cwd_match
+                    self._alias_index[cwd_match] = cwd_match
+                    if normalized_group:
+                        self._group_index[(normalized_cwd, normalized_group)] = cwd_match
                     return cwd_match
+
+            canonical = self._alias_index.get(conversation_id)
+            if canonical:
+                return canonical
 
         if await self.conversation_exists(conversation_id):
             conv = await self.get_or_create_conversation(conversation_id)
             async with conv.lock:
                 cwd_value = conv.cwd
                 conv_group = conv.conversation_group
-            await self._register_conversation_id(
+            canonical = await self._register_conversation_id(
                 conversation_id=conv.conversation_id,
                 cwd=cwd_value,
                 conversation_group=conv_group,
             )
-            return conversation_id
+            return canonical or conversation_id
 
         return None
 
@@ -340,11 +349,8 @@ class ConversationManager:
                     conv.conversation_group = normalized_group
                     should_write = True
                 elif conv.conversation_group != normalized_group:
-                    raise ConversationGroupMismatchError(
-                        conversation_id=conversation_id,
-                        expected_group=conv.conversation_group,
-                        got_group=normalized_group,
-                    )
+                    conv.conversation_group = normalized_group
+                    should_write = True
 
         if should_write:
             await asyncio.to_thread(self._write_meta, conv)
@@ -374,6 +380,10 @@ class ConversationManager:
             conversation_group=group,
         )
 
+        options: ClaudeAgentOptions | None = None
+        cwd_value: str | None = None
+        conv_group: str | None = None
+
         async with conv.lock:
             if conv.is_running:
                 return False
@@ -383,13 +393,20 @@ class ConversationManager:
 
             async with self._cwd_lock:
                 active = self._active_run_by_cwd.get(conv.cwd)
-                if active is not None and active != conversation_id:
+                if active is not None:
                     raise AgentFolderBusyError(cwd=conv.cwd)
                 self._active_run_by_cwd[conv.cwd] = conversation_id
 
             conv.prompt = prompt
             conv.is_running = True
             conv.is_done = False
+            cwd_value = conv.cwd
+            conv_group = conv.conversation_group
+
+            user_payload = self._build_user_prompt_event(prompt)
+            if user_payload:
+                json_line = json.dumps(user_payload, separators=(",", ":"), ensure_ascii=False)
+                self._append_event(conv, json_line=json_line)
 
             options = self._build_options(request_body)
             if getattr(options, "cwd", None) in (None, "") and conv.cwd:
@@ -397,14 +414,68 @@ class ConversationManager:
             if request_body.get("resume") is None and conv.claude_session_id:
                 options.resume = conv.claude_session_id
 
-            try:
+        if cwd_value:
+            old_canonical = await self._promote_canonical(
+                conversation_id=conversation_id,
+                cwd=cwd_value,
+                conversation_group=conv_group,
+            )
+            if old_canonical and old_canonical != conversation_id:
+                await self._emit_session_switch(
+                    previous_id=old_canonical,
+                    new_id=conversation_id,
+                    cwd=cwd_value,
+                )
+
+        try:
+            async with conv.lock:
                 conv.runner_task = asyncio.create_task(self._run_agent(conv=conv, prompt=prompt, options=options))
-            except Exception:
-                async with self._cwd_lock:
-                    if self._active_run_by_cwd.get(conv.cwd) == conversation_id:
-                        self._active_run_by_cwd.pop(conv.cwd, None)
-                raise
+        except Exception:
+            async with self._cwd_lock:
+                if self._active_run_by_cwd.get(conv.cwd) == conversation_id:
+                    self._active_run_by_cwd.pop(conv.cwd, None)
+            raise
         return True
+
+    async def activate_conversation(
+        self,
+        *,
+        conversation_id: str,
+        cwd: str,
+        conversation_group: str | None = None,
+    ) -> str | None:
+        await self.ensure_cwd_binding(
+            conversation_id=conversation_id,
+            cwd=cwd,
+            conversation_group=conversation_group,
+        )
+
+        conv = await self.get_or_create_conversation(conversation_id)
+        async with conv.lock:
+            cwd_value = conv.cwd
+            conv_group = conv.conversation_group
+
+        if not cwd_value:
+            raise ValueError("cwd is required to activate a conversation.")
+
+        async with self._cwd_lock:
+            active = self._active_run_by_cwd.get(cwd_value)
+            if active is not None and active != conversation_id:
+                raise AgentFolderBusyError(cwd=cwd_value)
+
+        old_canonical = await self._promote_canonical(
+            conversation_id=conversation_id,
+            cwd=cwd_value,
+            conversation_group=conv_group,
+        )
+        if old_canonical and old_canonical != conversation_id:
+            await self._emit_session_switch(
+                previous_id=old_canonical,
+                new_id=conversation_id,
+                cwd=cwd_value,
+            )
+
+        return old_canonical
 
     async def sse_stream(self, *, conversation_id: str, since: int, request: Any) -> AsyncIterator[bytes]:
         conv = await self.get_or_create_conversation(conversation_id)
@@ -545,6 +616,59 @@ class ConversationManager:
             q.put_nowait((eid, json_line))
 
         return eid, json_line
+
+    def _build_user_prompt_event(self, prompt: str) -> dict[str, Any] | None:
+        if not prompt:
+            return None
+        return {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            },
+        }
+
+    async def _promote_canonical(
+        self,
+        *,
+        conversation_id: str,
+        cwd: str,
+        conversation_group: str | None = None,
+    ) -> str | None:
+        normalized_cwd = self._normalize_cwd(cwd)
+        if not normalized_cwd:
+            return None
+
+        normalized_group = self._normalize_conversation_group(conversation_group)
+
+        async with self._cwd_index_lock:
+            old_canonical = self._cwd_index.get(normalized_cwd)
+            self._cwd_index[normalized_cwd] = conversation_id
+
+            for key in list(self._group_index.keys()):
+                if key[0] == normalized_cwd:
+                    self._group_index[key] = conversation_id
+            if normalized_group:
+                self._group_index[(normalized_cwd, normalized_group)] = conversation_id
+
+            self._alias_index[conversation_id] = conversation_id
+            if old_canonical:
+                self._alias_index[old_canonical] = conversation_id
+
+        return old_canonical
+
+    async def _emit_session_switch(self, *, previous_id: str, new_id: str, cwd: str) -> None:
+        conv = await self.get_or_create_conversation(previous_id)
+        payload = {
+            "type": "proxy_session",
+            "event": "switched",
+            "canonical_id": new_id,
+            "previous_id": previous_id,
+            "cwd": cwd,
+        }
+        json_line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        async with conv.lock:
+            self._append_event(conv, json_line=json_line)
 
     async def _run_agent(self, *, conv: _Conversation, prompt: str, options: ClaudeAgentOptions) -> None:
         saw_result = False
@@ -771,25 +895,6 @@ class ConversationManager:
             return None
 
         normalized_group = self._normalize_conversation_group(conversation_group)
-        if normalized_group:
-            if cwd is None or not str(cwd).strip():
-                async with self._cwd_index_lock:
-                    self._alias_index[conversation_id] = conversation_id
-                return conversation_id
-
-            normalized_cwd = self._normalize_cwd(cwd)
-            async with self._cwd_index_lock:
-                key = (normalized_cwd, normalized_group)
-                canonical = self._group_index.get(key)
-                if canonical is None:
-                    canonical = conversation_id
-                    self._group_index[key] = canonical
-
-                self._alias_index[conversation_id] = canonical
-                self._alias_index[canonical] = canonical
-
-            return canonical
-
         if cwd is None or not str(cwd).strip():
             async with self._cwd_index_lock:
                 self._alias_index[conversation_id] = conversation_id
@@ -801,6 +906,9 @@ class ConversationManager:
             if canonical is None:
                 canonical = conversation_id
                 self._cwd_index[normalized_cwd] = canonical
+
+            if normalized_group:
+                self._group_index[(normalized_cwd, normalized_group)] = canonical
 
             self._alias_index[conversation_id] = canonical
             self._alias_index[canonical] = canonical

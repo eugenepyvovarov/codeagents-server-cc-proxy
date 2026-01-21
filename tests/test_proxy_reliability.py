@@ -14,6 +14,7 @@ from claude_agent_sdk.types import (
 import httpx
 
 from app import create_app
+from claude_proxy.conversation_manager import AgentFolderBusyError, ConversationManager
 
 
 async def _fake_backend(*, prompt: str, options):
@@ -118,11 +119,15 @@ async def test_disconnect_then_replay(tmp_path):
             json={"text": "hello", "conversation_id": "c1", "cwd": "/tmp"},
         ) as resp:
             assert resp.status_code == 200
-            received = await _collect_sse_events(resp, limit=1)
+            received = await _collect_sse_events(resp, limit=2)
 
         assert received
-        first_eid, first_payload = received[-1]
-        assert first_payload.get("session_id") == "upstream-session"
+        first_eid = received[-1][0]
+        session_payload = next(
+            (payload for _, payload in received if payload.get("session_id") == "upstream-session"),
+            None,
+        )
+        assert session_payload is not None
 
         # Ensure the background run continues after the client disconnects.
         await asyncio.sleep(0.3)
@@ -138,24 +143,13 @@ async def test_disconnect_then_replay(tmp_path):
 
 @pytest.mark.asyncio
 async def test_agent_folder_lock(tmp_path):
-    app = create_app(store_dir=tmp_path, backend=_slow_backend)
-
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        async with client.stream(
-            "POST",
-            "/v1/agent/stream",
-            json={"conversation_id": "c1", "cwd": "/tmp", "text": "hello"},
-        ) as resp:
-            assert resp.status_code == 200
-            _ = await _collect_sse_events(resp, limit=1)
-
-        busy = await client.post(
-            "/v1/agent/stream",
-            json={"conversation_id": "c2", "cwd": "/tmp", "text": "hello2"},
-        )
-        assert busy.status_code == 409
-        assert busy.json().get("error") == "conversation_already_running"
+    manager = ConversationManager(store_dir=tmp_path, backend=_slow_backend)
+    await manager.start_run(conversation_id="c1", prompt="hello", request_body={"cwd": "/tmp"})
+    with pytest.raises(AgentFolderBusyError):
+        await manager.start_run(conversation_id="c2", prompt="hello2", request_body={"cwd": "/tmp"})
+    conv = await manager.get_or_create_conversation("c1")
+    if conv.runner_task:
+        await conv.runner_task
 
 
 @pytest.mark.asyncio

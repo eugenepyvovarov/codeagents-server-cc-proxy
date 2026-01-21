@@ -178,6 +178,85 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             headers=proxy_headers(),
         )
 
+    @app.post("/v1/conversations/activate")
+    async def activate_conversation(request: Request) -> JSONResponse:
+        body: dict[str, Any] = await request.json()
+
+        conversation_id = body.get("conversation_id") or body.get("session_id")
+        if conversation_id is None:
+            return json_error(400, error="bad_request", message="conversation_id is required.")
+        if not isinstance(conversation_id, str):
+            return json_error(400, error="bad_request", message="conversation_id must be a string.")
+        try:
+            conversation_id = sanitize_id(conversation_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        group_value = body.get("conversation_group")
+        conversation_group: str | None = None
+        if group_value is not None:
+            if not isinstance(group_value, str):
+                return json_error(400, error="bad_request", message="conversation_group must be a string.")
+            group_value = group_value.strip()
+            if group_value:
+                try:
+                    conversation_group = sanitize_id(group_value)
+                except ValueError as exc:
+                    return json_error(400, error="bad_request", message=str(exc))
+
+        cwd_value = body.get("cwd")
+        if not isinstance(cwd_value, str) or not cwd_value.strip():
+            return json_error(400, error="bad_request", message="cwd is required.")
+
+        try:
+            previous_id = await manager.activate_conversation(
+                conversation_id=conversation_id,
+                cwd=cwd_value,
+                conversation_group=conversation_group,
+            )
+        except AgentFolderBusyError as exc:
+            return json_error(409, error="agent_folder_busy", cwd=exc.cwd, retry_after_ms=2000)
+        except ConversationCwdMismatchError as exc:
+            return json_error(
+                409,
+                error="conversation_cwd_mismatch",
+                conversation_id=conversation_id,
+                expected_cwd=exc.expected_cwd,
+                got_cwd=exc.got_cwd,
+            )
+        except ConversationGroupMismatchError as exc:
+            return json_error(
+                409,
+                error="conversation_group_mismatch",
+                conversation_id=conversation_id,
+                expected_group=exc.expected_group,
+                got_group=exc.got_group,
+            )
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        await manager.log_cwd_event(
+            cwd=cwd_value,
+            event="activate",
+            payload={
+                "conversation_id": conversation_id,
+                "previous_id": previous_id,
+                "conversation_group": conversation_group,
+            },
+            version=version,
+            started_at=started_at,
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "conversation_id": conversation_id,
+                "canonical_id": conversation_id,
+                "previous_id": previous_id,
+            },
+            headers=proxy_headers(),
+        )
+
     @app.post("/v1/agent/stream")
     async def agent_stream(request: Request) -> StreamingResponse:
         body: dict[str, Any] = await request.json()
@@ -358,13 +437,14 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return json_error(404, error="conversation_unknown", conversation_id=conversation_id)
         conversation_id = resolved
         conversation = await manager.get_or_create_conversation(conversation_id)
+        alias_used = incoming_conversation_id != resolved
         await manager.log_cwd_event(
             cwd=cwd or conversation.cwd,
             event="replay",
             payload={
                 "incoming_conversation_id": incoming_conversation_id,
                 "resolved_conversation_id": resolved,
-                "alias_used": incoming_conversation_id != resolved,
+                "alias_used": alias_used,
                 "since": since,
                 "cwd_param_provided": bool(cwd),
                 "conversation_group": conversation_group,
@@ -372,6 +452,25 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             version=version,
             started_at=started_at,
         )
+
+        if alias_used and since > 0:
+            payload = {
+                "type": "proxy_session",
+                "event": "switched",
+                "canonical_id": resolved,
+                "previous_id": incoming_conversation_id,
+                "cwd": cwd or conversation.cwd or "",
+            }
+            json_line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+            async def iter_ndjson():
+                yield (json_line + "\n").encode("utf-8")
+
+            return StreamingResponse(
+                iter_ndjson(),
+                media_type="application/x-ndjson",
+                headers=proxy_headers(),
+            )
 
         async def iter_ndjson():
             async for line in manager.iter_ndjson(conversation_id=conversation_id, since=since):

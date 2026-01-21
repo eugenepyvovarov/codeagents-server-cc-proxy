@@ -133,7 +133,7 @@ async def test_replay_without_cwd_returns_unknown(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_conversation_group_isolates_cwd_aliasing(tmp_path):
+async def test_conversation_group_follows_latest_canonical(tmp_path):
     app = create_app(store_dir=tmp_path, backend=_alias_backend)
 
     transport = httpx.ASGITransport(app=app)
@@ -178,4 +178,4 @@ async def test_conversation_group_isolates_cwd_aliasing(tmp_path):
     g2_text = json.dumps([json.loads(line) for line in replay_g2.text.splitlines() if line.strip()])
     g1_text = json.dumps([json.loads(line) for line in replay_g1.text.splitlines() if line.strip()])
     assert "Echo: second" in g2_text
-    assert "Echo: first" in g1_text
+    assert "Echo: second" in g1_text

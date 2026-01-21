@@ -47,6 +47,7 @@ Body:
 ```json
 {
   "conversation_id": "uuid-string",
+  "conversation_group": "optional-group-id",
   "text": "Hello",
   "cwd": "/root/projects/my-project",
   "allowed_tools": ["Bash", "Read", "Write"],
@@ -58,8 +59,11 @@ Body:
 Notes:
 
 - `conversation_id` is the stable chat/thread id owned by the client (iOS).
+- `conversation_group` is an optional aliasing key. When set, conversations with the same
+  `cwd` only alias within the same group (use this to start a fresh session for a folder).
 - `cwd` is the agent folder on the server. A conversation is bound to its first `cwd` and mismatches are rejected.
-- Multiple `conversation_id` values that target the same `cwd` will share one canonical conversation.
+- Multiple `conversation_id` values that target the same `cwd` will share one canonical conversation,
+  unless `conversation_group` is provided (in that case, the group scopes the aliasing).
 - Only 1 active run per `cwd` is allowed. If the folder is busy, the proxy returns:
   `409 { "error": "agent_folder_busy", "cwd": "...", "retry_after_ms": 2000 }`.
 
@@ -67,7 +71,7 @@ Resume from a specific event id by sending `Last-Event-ID: <event_id>` header.
 
 ### Replay missed events
 
-`GET /v1/conversations/{conversation_id}/events?since=<event_id>[&cwd=<path>]`
+`GET /v1/conversations/{conversation_id}/events?since=<event_id>[&cwd=<path>][&conversation_group=<id>]`
 
 Returns `application/x-ndjson` where each line is the same JSON payload that was sent via SSE
 (Claude stream-json objects).

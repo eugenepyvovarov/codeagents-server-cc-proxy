@@ -15,6 +15,7 @@ from claude_proxy.backends import default_backend
 from claude_proxy.conversation_manager import (
     AgentFolderBusyError,
     ConversationCwdMismatchError,
+    ConversationGroupMismatchError,
     ConversationManager,
 )
 from claude_proxy.util import parse_int, sanitize_id
@@ -184,6 +185,18 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return json_error(400, error="bad_request", message=str(exc))
         incoming_conversation_id = conversation_id
 
+        group_value = body.get("conversation_group")
+        conversation_group: str | None = None
+        if group_value is not None:
+            if not isinstance(group_value, str):
+                return json_error(400, error="bad_request", message="conversation_group must be a string.")
+            group_value = group_value.strip()
+            if group_value:
+                try:
+                    conversation_group = sanitize_id(group_value)
+                except ValueError as exc:
+                    return json_error(400, error="bad_request", message=str(exc))
+
         since = parse_int(request.headers.get("Last-Event-ID"), default=0)
         if since is None:
             return json_error(400, error="bad_request", message="Invalid Last-Event-ID header.")
@@ -191,7 +204,11 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         cwd_value = body.get("cwd")
         cwd = cwd_value if isinstance(cwd_value, str) else None
         try:
-            conversation_id = await manager.resolve_conversation_id(conversation_id=conversation_id, cwd=cwd)
+            conversation_id = await manager.resolve_conversation_id(
+                conversation_id=conversation_id,
+                cwd=cwd,
+                conversation_group=conversation_group,
+            )
         except ConversationCwdMismatchError as exc:
             return json_error(
                 409,
@@ -199,6 +216,14 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 conversation_id=conversation_id,
                 expected_cwd=exc.expected_cwd,
                 got_cwd=exc.got_cwd,
+            )
+        except ConversationGroupMismatchError as exc:
+            return json_error(
+                409,
+                error="conversation_group_mismatch",
+                conversation_id=conversation_id,
+                expected_group=exc.expected_group,
+                got_group=exc.got_group,
             )
         except ValueError as exc:
             return json_error(400, error="bad_request", message=str(exc))
@@ -214,6 +239,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 "since": since,
                 "has_prompt": bool(prompt),
                 "is_running": conversation.is_running,
+                "conversation_group": conversation_group,
             },
             version=version,
             started_at=started_at,
@@ -225,7 +251,11 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             if not isinstance(cwd_value, str):
                 return json_error(400, error="bad_request", message="cwd is required to attach.")
             try:
-                await manager.ensure_cwd_binding(conversation_id=conversation_id, cwd=cwd_value)
+                await manager.ensure_cwd_binding(
+                    conversation_id=conversation_id,
+                    cwd=cwd_value,
+                    conversation_group=conversation_group,
+                )
             except ConversationCwdMismatchError as exc:
                 return json_error(
                     409,
@@ -233,6 +263,14 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                     conversation_id=conversation_id,
                     expected_cwd=exc.expected_cwd,
                     got_cwd=exc.got_cwd,
+                )
+            except ConversationGroupMismatchError as exc:
+                return json_error(
+                    409,
+                    error="conversation_group_mismatch",
+                    conversation_id=conversation_id,
+                    expected_group=exc.expected_group,
+                    got_group=exc.got_group,
                 )
             except ValueError as exc:
                 return json_error(400, error="bad_request", message=str(exc))
@@ -250,6 +288,14 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                     conversation_id=conversation_id,
                     expected_cwd=exc.expected_cwd,
                     got_cwd=exc.got_cwd,
+                )
+            except ConversationGroupMismatchError as exc:
+                return json_error(
+                    409,
+                    error="conversation_group_mismatch",
+                    conversation_id=conversation_id,
+                    expected_group=exc.expected_group,
+                    got_group=exc.got_group,
                 )
             except ValueError as exc:
                 return json_error(400, error="bad_request", message=str(exc))
@@ -279,7 +325,21 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return json_error(400, error="bad_request", message="Invalid since parameter.")
 
         cwd = request.query_params.get("cwd")
-        resolved = await manager.resolve_existing_conversation_id(conversation_id=conversation_id, cwd=cwd)
+        group_value = request.query_params.get("conversation_group")
+        conversation_group: str | None = None
+        if group_value is not None:
+            group_value = group_value.strip()
+            if group_value:
+                try:
+                    conversation_group = sanitize_id(group_value)
+                except ValueError as exc:
+                    return json_error(400, error="bad_request", message=str(exc))
+
+        resolved = await manager.resolve_existing_conversation_id(
+            conversation_id=conversation_id,
+            cwd=cwd,
+            conversation_group=conversation_group,
+        )
         if resolved is None:
             return json_error(404, error="conversation_unknown", conversation_id=conversation_id)
         conversation_id = resolved
@@ -293,6 +353,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 "alias_used": incoming_conversation_id != resolved,
                 "since": since,
                 "cwd_param_provided": bool(cwd),
+                "conversation_group": conversation_group,
             },
             version=version,
             started_at=started_at,

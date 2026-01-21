@@ -69,6 +69,39 @@ Notes:
 
 Resume from a specific event id by sending `Last-Event-ID: <event_id>` header.
 
+### Scheduled tasks
+
+`GET /v1/agent/tasks` lists tasks, `POST` creates, `PATCH` updates, `DELETE` removes.
+
+Create payload:
+
+```json
+{
+  "agent_id": "agent-uuid",
+  "conversation_id": "conversation-uuid",
+  "conversation_group": "optional-group",
+  "cwd": "/root/projects/my-project",
+  "title": "Daily summary",
+  "prompt": "Summarize the repo status.",
+  "enabled": true,
+  "time_zone": "Europe/Prague",
+  "schedule": {
+    "frequency": "daily",
+    "interval": 1,
+    "weekday_mask": 62,
+    "monthly_mode": "day_of_month",
+    "day_of_month": 15,
+    "weekday_ordinal": "first",
+    "weekday": 2,
+    "month": 3,
+    "time_minutes": 540
+  }
+}
+```
+
+Tasks are stored in `data/tasks.db` and executed by an in-process scheduler. If the agent is already
+running, the proxy queues the task and runs it as soon as the folder is free.
+
 ### Replay missed events
 
 `GET /v1/conversations/{conversation_id}/events?since=<event_id>[&cwd=<path>][&conversation_group=<id>]`

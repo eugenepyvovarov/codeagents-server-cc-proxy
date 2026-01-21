@@ -95,6 +95,13 @@ class ConversationManager:
         self._alias_index: dict[str, str] = {}
         self._cwd_index_lock = asyncio.Lock()
         self._prime_cwd_index()
+        self._on_run_finished: Callable[[str], Any] | None = None
+
+    def set_run_finished_callback(
+        self,
+        callback: Callable[[str], asyncio.Future[None] | asyncio.Task[None] | None] | None,
+    ) -> None:
+        self._on_run_finished = callback
 
     def new_conversation_id(self) -> str:
         return uuid.uuid4().hex
@@ -347,7 +354,7 @@ class ConversationManager:
                 conversation_group=conv.conversation_group,
             )
 
-    async def start_run(self, *, conversation_id: str, prompt: str, request_body: dict[str, Any]) -> None:
+    async def start_run(self, *, conversation_id: str, prompt: str, request_body: dict[str, Any]) -> bool:
         prompt = prompt.strip()
         if not prompt:
             raise ValueError("text required to start a new run.")
@@ -369,7 +376,7 @@ class ConversationManager:
 
         async with conv.lock:
             if conv.is_running:
-                return
+                return False
 
             if conv.cwd is None:
                 raise ValueError("cwd is required to start a new run.")
@@ -397,6 +404,7 @@ class ConversationManager:
                     if self._active_run_by_cwd.get(conv.cwd) == conversation_id:
                         self._active_run_by_cwd.pop(conv.cwd, None)
                 raise
+        return True
 
     async def sse_stream(self, *, conversation_id: str, since: int, request: Any) -> AsyncIterator[bytes]:
         conv = await self.get_or_create_conversation(conversation_id)
@@ -598,6 +606,14 @@ class ConversationManager:
                 async with self._cwd_lock:
                     if self._active_run_by_cwd.get(cwd) == conv.conversation_id:
                         self._active_run_by_cwd.pop(cwd, None)
+
+                if self._on_run_finished:
+                    try:
+                        result = self._on_run_finished(cwd)
+                        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                            await result
+                    except Exception:
+                        logger.exception("Run finished callback failed")
 
     def _build_options(self, body: dict[str, Any]) -> ClaudeAgentOptions:
         kwargs: dict[str, Any] = {}

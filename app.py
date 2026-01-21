@@ -18,6 +18,14 @@ from claude_proxy.conversation_manager import (
     ConversationGroupMismatchError,
     ConversationManager,
 )
+from claude_proxy.task_scheduler import (
+    TaskScheduler,
+    TaskStore,
+    TaskValidationError,
+    parse_task_payload,
+    serialize_task,
+    update_task_from_payload,
+)
 from claude_proxy.util import parse_int, sanitize_id
 
 logger = logging.getLogger(__name__)
@@ -98,6 +106,10 @@ def _apply_repo_update(repo_dir: Path) -> bool:
 def create_app(*, store_dir: Path | None = None, backend=default_backend) -> FastAPI:
     app = FastAPI()
     manager = ConversationManager(store_dir=store_dir, backend=backend)
+    store_root = (store_dir or Path("data")).resolve()
+    task_store = TaskStore(store_root / "tasks.db")
+    task_scheduler = TaskScheduler(store=task_store, manager=manager)
+    manager.set_run_finished_callback(task_scheduler.on_run_finished)
     update_lock = asyncio.Lock()
     update_task: asyncio.Task[None] | None = None
     repo_dir = Path(__file__).resolve().parent
@@ -143,11 +155,13 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     async def _startup() -> None:
         nonlocal update_task
         update_task = asyncio.create_task(_auto_update_loop())
+        await task_scheduler.start()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         if update_task:
             update_task.cancel()
+        await task_scheduler.shutdown()
 
     def json_error(status_code: int, *, error: str, **extra: Any) -> JSONResponse:
         return JSONResponse(
@@ -367,6 +381,95 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             iter_ndjson(),
             media_type="application/x-ndjson",
             headers=proxy_headers({"Cache-Control": "no-cache"}),
+        )
+
+    @app.get("/v1/agent/tasks")
+    async def list_tasks(
+        agent_id: str | None = None,
+        conversation_id: str | None = None,
+        conversation_group: str | None = None,
+    ) -> JSONResponse:
+        try:
+            agent_value = sanitize_id(agent_id) if agent_id else None
+            conversation_value = sanitize_id(conversation_id) if conversation_id else None
+            group_value = sanitize_id(conversation_group) if conversation_group else None
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        tasks = await task_store.list_tasks(
+            agent_id=agent_value,
+            conversation_id=conversation_value,
+            conversation_group=group_value,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"tasks": [serialize_task(task) for task in tasks]},
+            headers=proxy_headers(),
+        )
+
+    @app.post("/v1/agent/tasks")
+    async def create_task(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            return json_error(400, error="bad_request", message="Invalid JSON payload.")
+
+        try:
+            record = parse_task_payload(payload)
+        except (TaskValidationError, ValueError) as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        stored = await task_scheduler.create_task(record)
+        return JSONResponse(
+            status_code=201,
+            content={"task": serialize_task(stored)},
+            headers=proxy_headers(),
+        )
+
+    @app.patch("/v1/agent/tasks/{task_id}")
+    async def update_task(task_id: str, request: Request) -> JSONResponse:
+        try:
+            task_id = sanitize_id(task_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        existing = await task_store.get_task(task_id)
+        if existing is None:
+            return json_error(404, error="task_not_found", task_id=task_id)
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return json_error(400, error="bad_request", message="Invalid JSON payload.")
+
+        try:
+            updated = update_task_from_payload(existing, payload)
+        except (TaskValidationError, ValueError) as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        stored = await task_scheduler.update_task(task_id, updated)
+        return JSONResponse(
+            status_code=200,
+            content={"task": serialize_task(stored)},
+            headers=proxy_headers(),
+        )
+
+    @app.delete("/v1/agent/tasks/{task_id}")
+    async def delete_task(task_id: str) -> JSONResponse:
+        try:
+            task_id = sanitize_id(task_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        existing = await task_store.get_task(task_id)
+        if existing is None:
+            return json_error(404, error="task_not_found", task_id=task_id)
+
+        await task_scheduler.delete_task(task_id)
+        return JSONResponse(
+            status_code=200,
+            content={"ok": True},
+            headers=proxy_headers(),
         )
 
     return app

@@ -16,6 +16,7 @@ from typing import Any
 from claude_agent_sdk import ClaudeAgentOptions
 
 from claude_proxy.serialization import serialize_message
+from claude_proxy.push_notifications import trigger_reply_finished
 
 logger = logging.getLogger(__name__)
 
@@ -730,6 +731,13 @@ class ConversationManager:
                 async with self._cwd_lock:
                     if self._active_run_by_cwd.get(cwd) == conv.conversation_id:
                         self._active_run_by_cwd.pop(cwd, None)
+
+                try:
+                    asyncio.create_task(
+                        trigger_reply_finished(cwd=cwd, conversation_id=conv.conversation_id)
+                    )
+                except Exception:
+                    logger.exception("Failed to schedule push trigger")
 
                 if self._on_run_finished:
                     try:

@@ -179,6 +179,35 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             headers=proxy_headers(),
         )
 
+    @app.get("/v1/conversations/canonical")
+    async def canonical_conversation(request: Request) -> JSONResponse:
+        cwd_value = request.query_params.get("cwd")
+        if not isinstance(cwd_value, str) or not cwd_value.strip():
+            return json_error(400, error="bad_request", message="cwd is required.")
+
+        candidate_id = manager.new_conversation_id()
+        try:
+            canonical_id = await manager.resolve_conversation_id(
+                conversation_id=candidate_id,
+                cwd=cwd_value,
+                conversation_group=None,
+            )
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        created = canonical_id == candidate_id
+        await manager.ensure_cwd_binding(
+            conversation_id=canonical_id,
+            cwd=cwd_value,
+            conversation_group=None,
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content={"canonical_id": canonical_id, "cwd": cwd_value, "created": created},
+            headers=proxy_headers(),
+        )
+
     @app.post("/v1/conversations/activate")
     async def activate_conversation(request: Request) -> JSONResponse:
         body: dict[str, Any] = await request.json()

@@ -8,17 +8,20 @@ import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny, ToolPermissionContext
 
 from claude_proxy.serialization import serialize_message
 from claude_proxy.push_notifications import trigger_reply_finished
 
 logger = logging.getLogger(__name__)
+
+TOOL_PERMISSION_TIMEOUT_SECONDS = 300
 
 
 class AgentFolderBusyError(RuntimeError):
@@ -97,6 +100,11 @@ class ConversationManager:
         self._cwd_index_lock = asyncio.Lock()
         self._prime_cwd_index()
         self._on_run_finished: Callable[[str], Any] | None = None
+
+        self._pending_tool_permissions: dict[
+            str, tuple[str, asyncio.Future[PermissionResultAllow | PermissionResultDeny]]
+        ] = {}
+        self._tool_permission_lock = asyncio.Lock()
 
     def set_run_finished_callback(
         self,
@@ -671,10 +679,122 @@ class ConversationManager:
         async with conv.lock:
             self._append_event(conv, json_line=json_line)
 
+    def _coerce_json(self, value: Any) -> Any:
+        try:
+            return json.loads(json.dumps(value, default=str))
+        except Exception:
+            return str(value)
+
+    def _format_permission_suggestions(self, context: ToolPermissionContext) -> list[str]:
+        suggestions: list[str] = []
+        for suggestion in getattr(context, "suggestions", []) or []:
+            try:
+                suggestions.append(
+                    json.dumps(asdict(suggestion), separators=(",", ":"), ensure_ascii=False)
+                )
+            except Exception:
+                suggestions.append(str(suggestion))
+        return suggestions
+
+    async def _await_tool_permission(
+        self,
+        *,
+        conv: _Conversation,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        permission_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[PermissionResultAllow | PermissionResultDeny] = loop.create_future()
+
+        async with self._tool_permission_lock:
+            self._pending_tool_permissions[permission_id] = (conv.conversation_id, future)
+
+        payload = {
+            "type": "tool_permission",
+            "permission_id": permission_id,
+            "tool_name": tool_name,
+            "input": self._coerce_json(tool_input),
+            "permission_suggestions": self._format_permission_suggestions(context),
+            "blocked_path": None,
+        }
+        json_line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        async with conv.lock:
+            self._append_event(conv, json_line=json_line)
+
+        await self.log_cwd_event(
+            cwd=conv.cwd,
+            event="tool_permission_request",
+            payload={
+                "conversation_id": conv.conversation_id,
+                "permission_id": permission_id,
+                "tool_name": tool_name,
+            },
+        )
+
+        try:
+            return await asyncio.wait_for(future, timeout=TOOL_PERMISSION_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            return PermissionResultDeny(message="Permission request timed out.", interrupt=False)
+        finally:
+            async with self._tool_permission_lock:
+                self._pending_tool_permissions.pop(permission_id, None)
+
+    async def resolve_tool_permission(
+        self,
+        *,
+        permission_id: str,
+        behavior: str,
+        message: str | None = None,
+        conversation_id: str | None = None,
+    ) -> bool:
+        async with self._tool_permission_lock:
+            entry = self._pending_tool_permissions.get(permission_id)
+            if entry is None:
+                return False
+            pending_conversation_id, future = entry
+            if conversation_id and pending_conversation_id != conversation_id:
+                return False
+            self._pending_tool_permissions.pop(permission_id, None)
+
+        if future.done():
+            return True
+
+        if behavior == "allow":
+            future.set_result(PermissionResultAllow())
+        else:
+            future.set_result(PermissionResultDeny(message=message or "Permission denied by user."))
+        return True
+
+    async def _cancel_pending_permissions(self, conversation_id: str) -> None:
+        pending: list[tuple[str, asyncio.Future[PermissionResultAllow | PermissionResultDeny]]] = []
+        async with self._tool_permission_lock:
+            for permission_id, (conv_id, future) in list(self._pending_tool_permissions.items()):
+                if conv_id == conversation_id:
+                    pending.append((permission_id, future))
+                    self._pending_tool_permissions.pop(permission_id, None)
+
+        for _, future in pending:
+            if not future.done():
+                future.set_result(PermissionResultDeny(message="Permission request cancelled.", interrupt=False))
+
     async def _run_agent(self, *, conv: _Conversation, prompt: str, options: ClaudeAgentOptions) -> None:
         saw_result = False
         should_trigger_push = False
         message_preview: str | None = None
+
+        async def can_use_tool(
+            tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
+        ) -> PermissionResultAllow | PermissionResultDeny:
+            return await self._await_tool_permission(
+                conv=conv,
+                tool_name=tool_name,
+                tool_input=tool_input,
+                context=context,
+            )
+
+        options.can_use_tool = can_use_tool
 
         try:
             async for message in self._backend(prompt=prompt, options=options):
@@ -733,6 +853,8 @@ class ConversationManager:
                 conv.is_done = True
                 for q in list(conv.subscribers):
                     q.put_nowait(None)
+
+            await self._cancel_pending_permissions(conv.conversation_id)
 
             cwd = conv.cwd
             if cwd:

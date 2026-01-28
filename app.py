@@ -407,6 +407,60 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             ),
         )
 
+    @app.post("/v1/agent/tool_permission")
+    async def tool_permission(request: Request) -> JSONResponse:
+        body: dict[str, Any] = await request.json()
+
+        permission_id = body.get("permission_id")
+        if not isinstance(permission_id, str) or not permission_id.strip():
+            return json_error(400, error="bad_request", message="permission_id is required.")
+        try:
+            permission_id = sanitize_id(permission_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        behavior = body.get("behavior")
+        if behavior not in ("allow", "deny"):
+            return json_error(400, error="bad_request", message="behavior must be allow or deny.")
+
+        message = body.get("message")
+        if message is not None and not isinstance(message, str):
+            return json_error(400, error="bad_request", message="message must be a string.")
+
+        conversation_id = body.get("conversation_id")
+        if conversation_id is not None:
+            if not isinstance(conversation_id, str):
+                return json_error(400, error="bad_request", message="conversation_id must be a string.")
+            try:
+                conversation_id = sanitize_id(conversation_id)
+            except ValueError as exc:
+                return json_error(400, error="bad_request", message=str(exc))
+
+        resolved = await manager.resolve_tool_permission(
+            permission_id=permission_id,
+            behavior=behavior,
+            message=message,
+            conversation_id=conversation_id,
+        )
+        if not resolved:
+            return json_error(404, error="permission_not_found", permission_id=permission_id)
+
+        cwd_value = body.get("cwd")
+        if isinstance(cwd_value, str) and cwd_value.strip():
+            await manager.log_cwd_event(
+                cwd=cwd_value,
+                event="tool_permission_decision",
+                payload={
+                    "permission_id": permission_id,
+                    "behavior": behavior,
+                    "conversation_id": conversation_id,
+                },
+                version=version,
+                started_at=started_at,
+            )
+
+        return JSONResponse(status_code=200, content={"ok": True}, headers=proxy_headers())
+
     @app.get("/v1/conversations/{conversation_id}/events")
     async def replay(conversation_id: str, request: Request) -> StreamingResponse:
         try:

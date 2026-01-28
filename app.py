@@ -164,11 +164,16 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             update_task.cancel()
         await task_scheduler.shutdown()
 
-    def json_error(status_code: int, *, error: str, **extra: Any) -> JSONResponse:
+    def json_error(status_code: int, *, error: str, reset: bool = False, **extra: Any) -> JSONResponse:
+        content: dict[str, Any] = {"error": error, **extra}
+        headers = proxy_headers()
+        if reset:
+            content["reset"] = True
+            headers["X-Proxy-Reset"] = "true"
         return JSONResponse(
             status_code=status_code,
-            content={"error": error, **extra},
-            headers=proxy_headers(),
+            content=content,
+            headers=headers,
         )
 
     @app.get("/healthz")
@@ -352,6 +357,8 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return json_error(400, error="bad_request", message=str(exc))
 
         conversation = await manager.get_or_create_conversation(conversation_id)
+        async with conversation.lock:
+            last_eid = conversation.last_event_id
         await manager.log_cwd_event(
             cwd=cwd or conversation.cwd,
             event="stream",
@@ -432,6 +439,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
+                    "X-Proxy-Last-Event-Id": str(last_eid),
                 }
             ),
         )
@@ -518,9 +526,11 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             conversation_group=conversation_group,
         )
         if resolved is None:
-            return json_error(404, error="conversation_unknown", conversation_id=conversation_id)
+            return json_error(404, error="conversation_unknown", reset=True, conversation_id=conversation_id)
         conversation_id = resolved
         conversation = await manager.get_or_create_conversation(conversation_id)
+        async with conversation.lock:
+            last_eid = conversation.last_event_id
         alias_used = incoming_conversation_id != resolved
         await manager.log_cwd_event(
             cwd=cwd or conversation.cwd,
@@ -553,7 +563,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return StreamingResponse(
                 iter_ndjson(),
                 media_type="application/x-ndjson",
-                headers=proxy_headers(),
+                headers=proxy_headers({"X-Proxy-Last-Event-Id": str(last_eid)}),
             )
 
         async def iter_ndjson():
@@ -563,7 +573,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         return StreamingResponse(
             iter_ndjson(),
             media_type="application/x-ndjson",
-            headers=proxy_headers({"Cache-Control": "no-cache"}),
+            headers=proxy_headers({"Cache-Control": "no-cache", "X-Proxy-Last-Event-Id": str(last_eid)}),
         )
 
     @app.get("/v1/agent/tasks")

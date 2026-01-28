@@ -7,7 +7,12 @@ from claude_agent_sdk import ClaudeAgentOptions, query
 
 
 async def _single_prompt(prompt: str) -> AsyncIterator[dict[str, Any]]:
-    yield {"role": "user", "content": [{"type": "text", "text": prompt}]}
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        "parent_tool_use_id": None,
+        "session_id": None,
+    }
 
 
 async def default_backend(*, prompt: str, options: ClaudeAgentOptions) -> AsyncIterator[Any]:

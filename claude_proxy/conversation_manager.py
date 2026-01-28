@@ -673,6 +673,8 @@ class ConversationManager:
 
     async def _run_agent(self, *, conv: _Conversation, prompt: str, options: ClaudeAgentOptions) -> None:
         saw_result = False
+        should_trigger_push = False
+        message_preview: str | None = None
 
         try:
             async for message in self._backend(prompt=prompt, options=options):
@@ -685,6 +687,12 @@ class ConversationManager:
 
                 if payload.get("type") == "result":
                     saw_result = True
+                    is_error_value = payload.get("is_error")
+                    if is_error_value is False:
+                        should_trigger_push = True
+                        result_value = payload.get("result")
+                        if isinstance(result_value, str) and result_value.strip():
+                            message_preview = result_value
 
                 session_id_value = payload.get("session_id")
                 if isinstance(session_id_value, str) and session_id_value.strip():
@@ -732,12 +740,17 @@ class ConversationManager:
                     if self._active_run_by_cwd.get(cwd) == conv.conversation_id:
                         self._active_run_by_cwd.pop(cwd, None)
 
-                try:
-                    asyncio.create_task(
-                        trigger_reply_finished(cwd=cwd, conversation_id=conv.conversation_id)
-                    )
-                except Exception:
-                    logger.exception("Failed to schedule push trigger")
+                if should_trigger_push:
+                    try:
+                        asyncio.create_task(
+                            trigger_reply_finished(
+                                cwd=cwd,
+                                conversation_id=conv.conversation_id,
+                                message_preview=message_preview,
+                            )
+                        )
+                    except Exception:
+                        logger.exception("Failed to schedule push trigger")
 
                 if self._on_run_finished:
                     try:

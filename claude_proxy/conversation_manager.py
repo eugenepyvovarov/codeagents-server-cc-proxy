@@ -824,6 +824,8 @@ class ConversationManager:
         should_trigger_push = False
         message_preview: str | None = None
         allow_set, deny_set = tool_approvals or (set(), set())
+        allow_all = "*" in allow_set
+        deny_all = "*" in deny_set
 
         async def pre_tool_use_hook(
             _input: Any, _tool_use_id: str | None, _context: dict[str, Any]
@@ -834,6 +836,10 @@ class ConversationManager:
             tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
         ) -> PermissionResultAllow | PermissionResultDeny:
             normalized = self._normalize_tool_name(tool_name)
+            if deny_all:
+                return PermissionResultDeny(message="Permission denied by user.", interrupt=False)
+            if allow_all:
+                return PermissionResultAllow()
             if normalized in deny_set:
                 return PermissionResultDeny(message="Permission denied by user.", interrupt=False)
             if normalized in allow_set:

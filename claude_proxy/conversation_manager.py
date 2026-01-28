@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions
-from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny, ToolPermissionContext
+from claude_agent_sdk.types import HookMatcher, PermissionResultAllow, PermissionResultDeny, ToolPermissionContext
 
 from claude_proxy.serialization import serialize_message
 from claude_proxy.push_notifications import trigger_reply_finished
@@ -390,6 +390,7 @@ class ConversationManager:
         )
 
         options: ClaudeAgentOptions | None = None
+        tool_approvals: tuple[set[str], set[str]] | None = None
         cwd_value: str | None = None
         conv_group: str | None = None
 
@@ -418,6 +419,7 @@ class ConversationManager:
                 self._append_event(conv, json_line=json_line)
 
             options = self._build_options(request_body)
+            tool_approvals = self._parse_tool_approvals(request_body)
             if getattr(options, "cwd", None) in (None, "") and conv.cwd:
                 options.cwd = conv.cwd
             if request_body.get("resume") is None and conv.claude_session_id:
@@ -438,7 +440,14 @@ class ConversationManager:
 
         try:
             async with conv.lock:
-                conv.runner_task = asyncio.create_task(self._run_agent(conv=conv, prompt=prompt, options=options))
+                conv.runner_task = asyncio.create_task(
+                    self._run_agent(
+                        conv=conv,
+                        prompt=prompt,
+                        options=options,
+                        tool_approvals=tool_approvals,
+                    )
+                )
         except Exception:
             async with self._cwd_lock:
                 if self._active_run_by_cwd.get(conv.cwd) == conversation_id:
@@ -696,6 +705,30 @@ class ConversationManager:
                 suggestions.append(str(suggestion))
         return suggestions
 
+    def _normalize_tool_name(self, tool_name: str) -> str:
+        return tool_name.strip().lower()
+
+    def _parse_tool_approvals(self, body: dict[str, Any]) -> tuple[set[str], set[str]]:
+        approvals = body.get("tool_approvals")
+        if not isinstance(approvals, dict):
+            return set(), set()
+
+        def collect(key: str) -> set[str]:
+            values = approvals.get(key)
+            if not isinstance(values, list):
+                return set()
+            out: set[str] = set()
+            for value in values:
+                if isinstance(value, str):
+                    normalized = self._normalize_tool_name(value)
+                    if normalized:
+                        out.add(normalized)
+            return out
+
+        allow = collect("allow")
+        deny = collect("deny")
+        return allow, deny
+
     async def _await_tool_permission(
         self,
         *,
@@ -779,14 +812,32 @@ class ConversationManager:
             if not future.done():
                 future.set_result(PermissionResultDeny(message="Permission request cancelled.", interrupt=False))
 
-    async def _run_agent(self, *, conv: _Conversation, prompt: str, options: ClaudeAgentOptions) -> None:
+    async def _run_agent(
+        self,
+        *,
+        conv: _Conversation,
+        prompt: str,
+        options: ClaudeAgentOptions,
+        tool_approvals: tuple[set[str], set[str]] | None = None,
+    ) -> None:
         saw_result = False
         should_trigger_push = False
         message_preview: str | None = None
+        allow_set, deny_set = tool_approvals or (set(), set())
+
+        async def pre_tool_use_hook(
+            _input: Any, _tool_use_id: str | None, _context: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {"continue_": True}
 
         async def can_use_tool(
             tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
         ) -> PermissionResultAllow | PermissionResultDeny:
+            normalized = self._normalize_tool_name(tool_name)
+            if normalized in deny_set:
+                return PermissionResultDeny(message="Permission denied by user.", interrupt=False)
+            if normalized in allow_set:
+                return PermissionResultAllow()
             return await self._await_tool_permission(
                 conv=conv,
                 tool_name=tool_name,
@@ -795,6 +846,10 @@ class ConversationManager:
             )
 
         options.can_use_tool = can_use_tool
+        if options.hooks is None:
+            options.hooks = {"PreToolUse": [HookMatcher(matcher=None, hooks=[pre_tool_use_hook])]}
+        elif "PreToolUse" not in options.hooks:
+            options.hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[pre_tool_use_hook])]
 
         try:
             async for message in self._backend(prompt=prompt, options=options):

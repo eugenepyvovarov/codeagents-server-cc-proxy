@@ -469,8 +469,92 @@ class TaskStore:
                     enqueued_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_pending_runs_cwd ON pending_runs(cwd);
+
+                CREATE TABLE IF NOT EXISTS agent_env_vars (
+                    agent_id TEXT NOT NULL,
+                    env_key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, env_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_env_agent_id ON agent_env_vars(agent_id);
                 """
             )
+
+    async def list_env(self, *, agent_id: str) -> list[dict[str, Any]]:
+        async with self._lock:
+            return await asyncio.to_thread(self._list_env_sync, agent_id)
+
+    def _list_env_sync(self, agent_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT env_key, value, enabled, updated_at
+                FROM agent_env_vars
+                WHERE agent_id = ?
+                ORDER BY env_key ASC
+                """,
+                (agent_id,),
+            ).fetchall()
+
+        env: list[dict[str, Any]] = []
+        for row in rows:
+            env.append(
+                {
+                    "key": row["env_key"],
+                    "value": row["value"],
+                    "enabled": bool(row["enabled"]),
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return env
+
+    async def replace_env(self, *, agent_id: str, env: list[dict[str, Any]]) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._replace_env_sync, agent_id, env)
+
+    def _replace_env_sync(self, agent_id: str, env: list[dict[str, Any]]) -> None:
+        now = _iso_utc(_now_utc())
+        with self._connect() as conn:
+            conn.execute("DELETE FROM agent_env_vars WHERE agent_id = ?", (agent_id,))
+            if not env:
+                return
+            rows = []
+            for item in env:
+                rows.append(
+                    (
+                        agent_id,
+                        item["key"],
+                        item["value"],
+                        1 if item.get("enabled", True) else 0,
+                        now,
+                    )
+                )
+            conn.executemany(
+                """
+                INSERT INTO agent_env_vars (agent_id, env_key, value, enabled, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    async def enabled_env(self, *, agent_id: str) -> dict[str, str]:
+        async with self._lock:
+            return await asyncio.to_thread(self._enabled_env_sync, agent_id)
+
+    def _enabled_env_sync(self, agent_id: str) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT env_key, value
+                FROM agent_env_vars
+                WHERE agent_id = ? AND enabled = 1
+                ORDER BY env_key ASC
+                """,
+                (agent_id,),
+            ).fetchall()
+        return {row["env_key"]: row["value"] for row in rows}
 
     async def list_tasks(
         self,
@@ -863,6 +947,7 @@ class TaskScheduler:
     async def _start_task_run(self, task: TaskRecord) -> bool:
         request_body = dict(task.request_body)
         request_body.setdefault("cwd", task.cwd)
+        request_body.setdefault("agent_id", task.agent_id)
         if task.conversation_group:
             request_body.setdefault("conversation_group", task.conversation_group)
         conversation_id = await self._resolve_task_conversation_id(task)

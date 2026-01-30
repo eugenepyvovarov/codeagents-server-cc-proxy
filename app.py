@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,16 @@ from claude_proxy.task_scheduler import (
 from claude_proxy.util import parse_int, sanitize_id
 
 logger = logging.getLogger(__name__)
+
+_ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_ENV_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_env_key(value: str) -> str:
+    normalized = _ENV_WHITESPACE_RE.sub("_", value.strip()).upper()
+    if not _ENV_KEY_RE.match(normalized):
+        raise ValueError("Invalid env key format.")
+    return normalized
 
 
 def _get_update_interval_seconds() -> int:
@@ -106,9 +117,9 @@ def _apply_repo_update(repo_dir: Path) -> bool:
 
 def create_app(*, store_dir: Path | None = None, backend=default_backend) -> FastAPI:
     app = FastAPI()
-    manager = ConversationManager(store_dir=store_dir, backend=backend)
     store_root = (store_dir or Path("data")).resolve()
     task_store = TaskStore(store_root / "tasks.db")
+    manager = ConversationManager(store_dir=store_dir, backend=backend, env_store=task_store)
     task_scheduler = TaskScheduler(store=task_store, manager=manager)
     manager.set_run_finished_callback(task_scheduler.on_run_finished)
     update_lock = asyncio.Lock()
@@ -295,6 +306,15 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     @app.post("/v1/agent/stream")
     async def agent_stream(request: Request) -> StreamingResponse:
         body: dict[str, Any] = await request.json()
+
+        agent_id = body.get("agent_id")
+        if agent_id is not None:
+            if not isinstance(agent_id, str) or not agent_id.strip():
+                return json_error(400, error="bad_request", message="agent_id must be a non-empty string.")
+            try:
+                body["agent_id"] = sanitize_id(agent_id)
+            except ValueError as exc:
+                return json_error(400, error="bad_request", message=str(exc))
 
         prompt = body.get("text") or body.get("prompt")
         if prompt is not None and not isinstance(prompt, str):
@@ -664,6 +684,73 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             content={"ok": True},
             headers=proxy_headers(),
         )
+
+    @app.get("/v1/agent/env")
+    async def list_env(agent_id: str | None = None) -> JSONResponse:
+        if not agent_id:
+            return json_error(400, error="bad_request", message="agent_id is required.")
+        try:
+            agent_value = sanitize_id(agent_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        env = await task_store.list_env(agent_id=agent_value)
+        return JSONResponse(
+            status_code=200,
+            content={"env": env},
+            headers=proxy_headers(),
+        )
+
+    @app.put("/v1/agent/env")
+    async def replace_env(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            return json_error(400, error="bad_request", message="Invalid JSON payload.")
+
+        agent_id = payload.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            return json_error(400, error="bad_request", message="agent_id is required.")
+        try:
+            agent_value = sanitize_id(agent_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        env_payload = payload.get("env")
+        if env_payload is None:
+            env_payload = []
+        if not isinstance(env_payload, list):
+            return json_error(400, error="bad_request", message="env must be a list.")
+
+        env: list[dict[str, Any]] = []
+        seen = set()
+        for item in env_payload:
+            if not isinstance(item, dict):
+                return json_error(400, error="bad_request", message="env entries must be objects.")
+
+            raw_key = item.get("key")
+            raw_value = item.get("value")
+            enabled_value = item.get("enabled", True)
+
+            if not isinstance(raw_key, str) or not raw_key.strip():
+                return json_error(400, error="bad_request", message="env.key must be a string.")
+            if not isinstance(raw_value, str):
+                return json_error(400, error="bad_request", message="env.value must be a string.")
+
+            try:
+                key = _normalize_env_key(raw_key)
+            except ValueError as exc:
+                return json_error(400, error="bad_request", message=str(exc))
+
+            if key in seen:
+                return json_error(400, error="bad_request", message="Duplicate env key.")
+            seen.add(key)
+
+            enabled = bool(enabled_value)
+            env.append({"key": key, "value": raw_value, "enabled": enabled})
+
+        await task_store.replace_env(agent_id=agent_value, env=env)
+        return JSONResponse(status_code=200, content={"ok": True}, headers=proxy_headers())
 
     return app
 

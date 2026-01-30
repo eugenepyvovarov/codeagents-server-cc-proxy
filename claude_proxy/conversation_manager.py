@@ -4,10 +4,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,30 @@ from claude_proxy.push_notifications import trigger_reply_finished
 logger = logging.getLogger(__name__)
 
 TOOL_PERMISSION_TIMEOUT_SECONDS = 300
+
+
+@contextmanager
+def _patched_environ(updates: dict[str, str]) -> Any:
+    if not updates:
+        yield
+        return
+
+    original: dict[str, str] = {}
+    created: set[str] = set()
+    for key, value in updates.items():
+        if key in os.environ:
+            original[key] = os.environ[key]
+        else:
+            created.add(key)
+        os.environ[key] = value
+
+    try:
+        yield
+    finally:
+        for key in created:
+            os.environ.pop(key, None)
+        for key, value in original.items():
+            os.environ[key] = value
 
 
 class AgentFolderBusyError(RuntimeError):
@@ -60,6 +86,7 @@ class _Conversation:
     cwd: str | None = None
     conversation_group: str | None = None
     claude_session_id: str | None = None
+    env_keys_hash: str | None = None
 
     last_event_id: int = 0
     is_running: bool = False
@@ -77,6 +104,7 @@ class ConversationManager:
         *,
         store_dir: Path | None,
         backend: Callable[..., AsyncIterator[Any]],
+        env_store: Any | None = None,
         buffer_size: int = 512,
         heartbeat_seconds: float = 15.0,
     ) -> None:
@@ -87,6 +115,8 @@ class ConversationManager:
         self._backend = backend
         self._buffer_size = buffer_size
         self._heartbeat_seconds = heartbeat_seconds
+        self._env_store = env_store
+        self._env_lock = asyncio.Lock()
 
         self._conversations: dict[str, _Conversation] = {}
         self._conversations_lock = asyncio.Lock()
@@ -376,6 +406,19 @@ class ConversationManager:
 
         conv = await self.get_or_create_conversation(conversation_id)
 
+        agent_id_value = request_body.get("agent_id")
+        agent_id = agent_id_value.strip() if isinstance(agent_id_value, str) and agent_id_value.strip() else None
+        env_vars: dict[str, str] = {}
+        env_keys: list[str] = []
+        env_keys_hash: str | None = None
+        if agent_id and self._env_store is not None:
+            try:
+                env_vars = await self._env_store.enabled_env(agent_id=agent_id)
+            except Exception:
+                env_vars = {}
+            env_keys = sorted(env_vars.keys())
+            env_keys_hash = hashlib.sha1(",".join(env_keys).encode("utf-8")).hexdigest()
+
         cwd_value = request_body.get("cwd")
         if isinstance(cwd_value, str):
             cwd = cwd_value
@@ -393,6 +436,7 @@ class ConversationManager:
         tool_approvals: tuple[set[str], set[str]] | None = None
         cwd_value: str | None = None
         conv_group: str | None = None
+        should_write_meta = False
 
         async with conv.lock:
             if conv.is_running:
@@ -418,12 +462,28 @@ class ConversationManager:
                 json_line = json.dumps(user_payload, separators=(",", ":"), ensure_ascii=False)
                 self._append_event(conv, json_line=json_line)
 
-            options = self._build_options(request_body)
+            options_body = request_body
+            if env_keys_hash is not None and env_keys_hash != conv.env_keys_hash:
+                conv.env_keys_hash = env_keys_hash
+                should_write_meta = True
+                if env_keys:
+                    env_prompt = self._env_system_prompt(env_keys)
+                    options_body = dict(request_body)
+                    existing = options_body.get("system_prompt")
+                    if isinstance(existing, str) and existing.strip():
+                        options_body["system_prompt"] = f"{existing}\n\n{env_prompt}"
+                    else:
+                        options_body["system_prompt"] = env_prompt
+
+            options = self._build_options(options_body)
             tool_approvals = self._parse_tool_approvals(request_body)
             if getattr(options, "cwd", None) in (None, "") and conv.cwd:
                 options.cwd = conv.cwd
             if request_body.get("resume") is None and conv.claude_session_id:
                 options.resume = conv.claude_session_id
+
+        if should_write_meta:
+            await asyncio.to_thread(self._write_meta, conv)
 
         if cwd_value:
             old_canonical = await self._promote_canonical(
@@ -446,6 +506,7 @@ class ConversationManager:
                         prompt=prompt,
                         options=options,
                         tool_approvals=tool_approvals,
+                        env_vars=env_vars,
                     )
                 )
         except Exception:
@@ -565,6 +626,10 @@ class ConversationManager:
         if isinstance(claude_session_id, str) and claude_session_id.strip():
             conv.claude_session_id = claude_session_id
 
+        env_keys_hash = payload.get("env_keys_hash")
+        if isinstance(env_keys_hash, str) and env_keys_hash.strip():
+            conv.env_keys_hash = env_keys_hash.strip()
+
     def _load_existing_events(self, conv: _Conversation) -> None:
         if not conv.events_path.exists():
             return
@@ -584,6 +649,12 @@ class ConversationManager:
 
         conv.is_running = False
         conv.is_done = True
+
+    def _env_system_prompt(self, keys: list[str]) -> str:
+        if not keys:
+            return ""
+        formatted = ", ".join(f"`{key}`" for key in keys)
+        return f"Env vars set for this agent: {formatted} (names only)."
 
     async def _iter_events(self, *, conv: _Conversation, since: int) -> AsyncIterator[tuple[int, str]]:
         async with conv.lock:
@@ -819,6 +890,7 @@ class ConversationManager:
         prompt: str,
         options: ClaudeAgentOptions,
         tool_approvals: tuple[set[str], set[str]] | None = None,
+        env_vars: dict[str, str] | None = None,
     ) -> None:
         saw_result = False
         should_trigger_push = False
@@ -857,7 +929,11 @@ class ConversationManager:
         elif "PreToolUse" not in options.hooks:
             options.hooks["PreToolUse"] = [HookMatcher(matcher=None, hooks=[pre_tool_use_hook])]
 
-        try:
+        async def _run_backend() -> None:
+            nonlocal message_preview
+            nonlocal saw_result
+            nonlocal should_trigger_push
+
             async for message in self._backend(prompt=prompt, options=options):
                 payload = serialize_message(message)
                 if not payload:
@@ -882,6 +958,13 @@ class ConversationManager:
                 json_line = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
                 async with conv.lock:
                     self._append_event(conv, json_line=json_line)
+
+        env_vars = env_vars or {}
+
+        try:
+            async with self._env_lock:
+                with _patched_environ(env_vars):
+                    await _run_backend()
         except Exception as exc:
             error_payload = {
                 "type": "result",
@@ -950,6 +1033,8 @@ class ConversationManager:
         project_settings_path: Path | None = None
         project_mcp_path: Path | None = None
         project_skills_dir: Path | None = None
+        project_rules_path: Path | None = None
+        project_root_rules_path: Path | None = None
         if isinstance(body.get("cwd"), str):
             kwargs["cwd"] = body["cwd"]
             cwd_path = Path(body["cwd"]).expanduser().resolve()
@@ -957,6 +1042,8 @@ class ConversationManager:
             project_settings_path = project_claude_dir / "settings.json"
             project_mcp_path = project_claude_dir / "mcp.json"
             project_skills_dir = project_claude_dir / "skills"
+            project_rules_path = project_claude_dir / "CLAUDE.md"
+            project_root_rules_path = cwd_path / "CLAUDE.md"
 
         allowed_tools = None
         if isinstance(body.get("allowed_tools"), list):
@@ -986,12 +1073,19 @@ class ConversationManager:
             kwargs["setting_sources"] = body["setting_sources"]
         else:
             user_skills_dir = Path.home() / ".claude" / "skills"
+            user_rules_path = Path.home() / ".claude" / "CLAUDE.md"
             should_load_settings = False
             if project_settings_path and project_settings_path.is_file():
                 should_load_settings = True
             if project_mcp_path and project_mcp_path.is_file():
                 should_load_settings = True
             if project_skills_dir and project_skills_dir.is_dir():
+                should_load_settings = True
+            if project_rules_path and project_rules_path.is_file():
+                should_load_settings = True
+            if project_root_rules_path and project_root_rules_path.is_file():
+                should_load_settings = True
+            if user_rules_path.is_file():
                 should_load_settings = True
             if user_skills_dir.is_dir():
                 should_load_settings = True
@@ -1035,6 +1129,7 @@ class ConversationManager:
             "cwd": conv.cwd,
             "conversation_group": conv.conversation_group,
             "claude_session_id": conv.claude_session_id,
+            "env_keys_hash": conv.env_keys_hash,
             "updated_at": _now_iso(),
         }
         if not conv.meta_path.exists():

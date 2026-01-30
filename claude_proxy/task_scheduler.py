@@ -196,10 +196,16 @@ def _normalize_schedule(value: Any, *, now: datetime) -> TaskSchedule:
         raise TaskValidationError("schedule must be an object")
 
     frequency = str(value.get("frequency") or "daily").strip().lower()
-    if frequency not in {"daily", "weekly", "monthly", "yearly"}:
-        raise TaskValidationError("schedule.frequency must be daily, weekly, monthly, or yearly")
+    if frequency not in {"minutely", "hourly", "daily", "weekly", "monthly", "yearly"}:
+        raise TaskValidationError(
+            "schedule.frequency must be minutely, hourly, daily, weekly, monthly, or yearly"
+        )
 
     interval = max(1, _normalize_int(value.get("interval"), 1))
+    if frequency == "minutely":
+        interval = min(interval, 60)
+    elif frequency == "hourly":
+        interval = min(interval, 24)
     weekday_mask = _normalize_int(value.get("weekday_mask"), 0)
     if weekday_mask <= 0:
         weekday_mask = 1 << (_weekday_number(now.date()) - 1)
@@ -1016,6 +1022,28 @@ def compute_next_run(task: TaskRecord, *, after: datetime) -> datetime:
     anchor_local = task.anchor_at.astimezone(tz)
     schedule = task.schedule
     time_minutes = schedule.time_minutes
+
+    if schedule.frequency == "minutely":
+        anchor_start = _combine_local(anchor_local.date(), 0, tz)
+        candidate_dt = after_local.replace(second=0, microsecond=0)
+        if candidate_dt <= after_local:
+            candidate_dt += timedelta(minutes=1)
+        minutes_between = int((candidate_dt - anchor_start).total_seconds() // 60)
+        remainder = minutes_between % schedule.interval
+        if remainder != 0:
+            candidate_dt += timedelta(minutes=(schedule.interval - remainder))
+        return candidate_dt.astimezone(timezone.utc)
+
+    if schedule.frequency == "hourly":
+        anchor_start = _combine_local(anchor_local.date(), 0, tz)
+        candidate_dt = after_local.replace(minute=0, second=0, microsecond=0)
+        if candidate_dt <= after_local:
+            candidate_dt += timedelta(hours=1)
+        hours_between = int((candidate_dt - anchor_start).total_seconds() // 3600)
+        remainder = hours_between % schedule.interval
+        if remainder != 0:
+            candidate_dt += timedelta(hours=(schedule.interval - remainder))
+        return candidate_dt.astimezone(timezone.utc)
 
     if schedule.frequency == "daily":
         candidate_date = after_local.date()

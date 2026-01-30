@@ -89,6 +89,7 @@ class _Conversation:
     env_keys_hash: str | None = None
 
     last_event_id: int = 0
+    renderable_bubble_count: int = 0
     is_running: bool = False
     is_done: bool = True
 
@@ -644,6 +645,7 @@ class ConversationManager:
                     eid += 1
                     conv.last_event_id = eid
                     conv.buffer.append((eid, raw))
+                    conv.renderable_bubble_count += self._renderable_bubble_increment(raw)
         except Exception:
             return
 
@@ -691,6 +693,7 @@ class ConversationManager:
             conv.is_done = conv.is_done or (not conv.is_running and conv.last_event_id == last_eid)
 
     def _append_event(self, conv: _Conversation, *, json_line: str) -> tuple[int, str]:
+        conv.renderable_bubble_count += self._renderable_bubble_increment(json_line)
         conv.last_event_id += 1
         eid = conv.last_event_id
 
@@ -705,6 +708,56 @@ class ConversationManager:
             q.put_nowait((eid, json_line))
 
         return eid, json_line
+
+    def _renderable_bubble_increment(self, raw_json_line: str) -> int:
+        """Returns how many unread-countable bubbles this event contributes.
+
+        This mirrors the iOS UI definition:
+        - Count 1 bubble per renderable block:
+          - text (non-empty after trimming), tool_use, tool_result
+        - Do not count:
+          - thinking-only/unknown blocks
+          - system/result events
+          - user prompt text
+
+        Note: tool_result blocks can arrive in `type=user` payloads (tool output),
+        so we count tool_* blocks regardless of message type, but we only count text
+        blocks for `type=assistant`.
+        """
+        try:
+            payload = json.loads(raw_json_line)
+        except Exception:
+            return 0
+
+        if not isinstance(payload, dict):
+            return 0
+
+        event_type = payload.get("type")
+        if event_type not in ("assistant", "user"):
+            return 0
+
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            return 0
+
+        content = message.get("content")
+        if not isinstance(content, list):
+            return 0
+
+        count = 0
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if block_type in ("tool_use", "tool_result"):
+                count += 1
+                continue
+            if block_type == "text" and event_type == "assistant":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    count += 1
+                continue
+        return count
 
     def _build_user_prompt_event(self, prompt: str) -> dict[str, Any] | None:
         if not prompt:
@@ -1008,11 +1061,14 @@ class ConversationManager:
 
                 if should_trigger_push:
                     try:
+                        async with conv.lock:
+                            renderable_count = conv.renderable_bubble_count
                         asyncio.create_task(
                             trigger_reply_finished(
                                 cwd=cwd,
                                 conversation_id=conv.conversation_id,
                                 message_preview=message_preview,
+                                renderable_assistant_count=renderable_count,
                             )
                         )
                     except Exception:

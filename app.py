@@ -379,6 +379,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         conversation = await manager.get_or_create_conversation(conversation_id)
         async with conversation.lock:
             last_eid = conversation.last_event_id
+            renderable_count = conversation.renderable_bubble_count
         await manager.log_cwd_event(
             cwd=cwd or conversation.cwd,
             event="stream",
@@ -460,6 +461,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                     "X-Proxy-Last-Event-Id": str(last_eid),
+                    "X-Proxy-Renderable-Assistant-Count": str(renderable_count),
                 }
             ),
         )
@@ -551,6 +553,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         conversation = await manager.get_or_create_conversation(conversation_id)
         async with conversation.lock:
             last_eid = conversation.last_event_id
+            renderable_count = conversation.renderable_bubble_count
         alias_used = incoming_conversation_id != resolved
         await manager.log_cwd_event(
             cwd=cwd or conversation.cwd,
@@ -583,7 +586,12 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return StreamingResponse(
                 iter_ndjson(),
                 media_type="application/x-ndjson",
-                headers=proxy_headers({"X-Proxy-Last-Event-Id": str(last_eid)}),
+                headers=proxy_headers(
+                    {
+                        "X-Proxy-Last-Event-Id": str(last_eid),
+                        "X-Proxy-Renderable-Assistant-Count": str(renderable_count),
+                    }
+                ),
             )
 
         async def iter_ndjson():
@@ -593,7 +601,13 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         return StreamingResponse(
             iter_ndjson(),
             media_type="application/x-ndjson",
-            headers=proxy_headers({"Cache-Control": "no-cache", "X-Proxy-Last-Event-Id": str(last_eid)}),
+            headers=proxy_headers(
+                {
+                    "Cache-Control": "no-cache",
+                    "X-Proxy-Last-Event-Id": str(last_eid),
+                    "X-Proxy-Renderable-Assistant-Count": str(renderable_count),
+                }
+            ),
         )
 
     @app.get("/v1/agent/tasks")

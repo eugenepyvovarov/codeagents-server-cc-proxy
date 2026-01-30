@@ -59,6 +59,7 @@ async def trigger_reply_finished(
     cwd: str,
     conversation_id: str | None = None,
     message_preview: str | None = None,
+    renderable_assistant_count: int | None = None,
 ) -> None:
     secret = _env("CODEAGENTS_PUSH_SECRET")
     base_url = _env("CODEAGENTS_PUSH_GATEWAY_BASE_URL")
@@ -69,6 +70,8 @@ async def trigger_reply_finished(
     payload: dict[str, Any] = {"cwd": cwd}
     if conversation_id:
         payload["conversation_id"] = conversation_id
+    if renderable_assistant_count is not None:
+        payload["renderable_assistant_count"] = renderable_assistant_count
     if message_preview:
         normalized = _normalize_preview(message_preview)
         if normalized:

@@ -502,7 +502,12 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             conversation_id=conversation_id,
         )
         if not resolved:
-            return json_error(404, error="permission_not_found", permission_id=permission_id)
+            return json_error(
+                404,
+                error="permission_not_found",
+                permission_id=permission_id,
+                message="Permission request expired or was already handled.",
+            )
 
         cwd_value = body.get("cwd")
         if isinstance(cwd_value, str) and cwd_value.strip():

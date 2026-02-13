@@ -292,6 +292,38 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             ),
         }
 
+    def _normalized_cwd(value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        normalized = normalized.rstrip("/")
+        return normalized or "/"
+
+    def _project_scope_key(cwd: str) -> str:
+        normalized = _normalized_cwd(cwd)
+        if not normalized:
+            return ""
+        marker = "/projects/"
+        if marker in normalized:
+            return normalized.split(marker, 1)[1].strip("/")
+        return normalized.split("/")[-1]
+
+    def _filter_tasks_by_cwd(tasks: list[Any], cwd: str) -> list[Any]:
+        normalized = _normalized_cwd(cwd)
+        if not normalized:
+            return tasks
+
+        exact = [task for task in tasks if _normalized_cwd(getattr(task, "cwd", "")) == normalized]
+        if exact:
+            return exact
+
+        # Path roots can differ across environments (for example /root/projects vs /home/<user>/projects).
+        # Fall back to a project-scope key so list does not silently drop valid tasks.
+        target_key = _project_scope_key(normalized)
+        if not target_key:
+            return []
+        return [task for task in tasks if _project_scope_key(getattr(task, "cwd", "")) == target_key]
+
     def _normalize_slug(value: Any) -> str | None:
         if not isinstance(value, str):
             return None
@@ -603,13 +635,6 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                         headers=proxy_headers(),
                     )
 
-            if not agent_id and not cwd:
-                return JSONResponse(
-                    status_code=200,
-                    content=_mcp_error(payload_id, -32602, "Missing active project context (agent_id/cwd)"),
-                    headers=proxy_headers(),
-                )
-
             enabled_filter = _to_bool(_first_non_empty(arguments.get("enabled"), arguments.get("isEnabled"), arguments.get("is_enabled")))
 
             limit_value = arguments.get("limit")
@@ -639,15 +664,15 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             if agent_id:
                 tasks = await task_store.list_tasks(agent_id=agent_id)
                 if cwd:
-                    tasks = [task for task in tasks if task.cwd == cwd]
+                    tasks = _filter_tasks_by_cwd(tasks, cwd)
                     if not tasks:
                         # Identity can drift between legacy and current clients.
-                        # Fall back to project-path scope to avoid false "no tasks".
+                        # Fall back to project-scope matching across all tasks.
                         all_tasks = await task_store.list_tasks()
-                        tasks = [task for task in all_tasks if task.cwd == cwd]
+                        tasks = _filter_tasks_by_cwd(all_tasks, cwd)
             else:
                 all_tasks = await task_store.list_tasks()
-                tasks = [task for task in all_tasks if task.cwd == cwd]
+                tasks = _filter_tasks_by_cwd(all_tasks, cwd)
 
             if enabled_filter is not None:
                 tasks = [task for task in tasks if task.enabled is enabled_filter]

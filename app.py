@@ -187,6 +187,284 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             headers=headers,
         )
 
+    MCP_TOOL_NAME_CREATE = "create_scheduled_task"
+    MCP_TOOL_NAME_UPDATE = "update_scheduled_task"
+    MCP_TOOL_NAME_DELETE = "delete_scheduled_task"
+    MCP_PROTOCOL_VERSION = "2025-03-26"
+    MCP_SERVER_NAME = "codeagents-scheduled-tasks"
+    MCP_SERVER_VERSION = "0.1.0"
+    MCP_CAPABILITY_VERSION = "2024-11-05"
+
+    def _mcp_result(payload_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+        return {"jsonrpc": "2.0", "id": payload_id, "result": result}
+
+    def _mcp_error(payload_id: Any, code: int, message: str, data: Any | None = None) -> dict[str, Any]:
+        error_payload: dict[str, Any] = {"code": code, "message": message}
+        if data is not None:
+            error_payload["data"] = data
+        return {"jsonrpc": "2.0", "id": payload_id, "error": error_payload}
+
+    def _first_non_empty(*values: Any) -> str | None:
+        for value in values:
+            if isinstance(value, str):
+                normalized = value.strip()
+                if normalized:
+                    return normalized
+        return None
+
+    def _to_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+        return None
+
+    def _to_str_array(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        references: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip().lstrip("@")
+            if normalized:
+                references.append(normalized)
+        return references
+
+    def _header_value(headers: dict[str, str], *names: str) -> str | None:
+        lowered = {key.lower(): value for key, value in headers.items()}
+        for name in names:
+            value = lowered.get(name.lower())
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _resolve_mcp_scope(request: Request, args: dict[str, Any] | None) -> dict[str, str]:
+        raw_args = args or {}
+        headers = dict(request.headers)
+        return {
+            "agent_id": (
+                _first_non_empty(
+                    _header_value(headers, "x-codeagents-agent-id", "x-codeagents-project-id"),
+                    raw_args.get("agent_id"),
+                    raw_args.get("project_id"),
+                )
+                or ""
+            ),
+            "conversation_id": (
+                _first_non_empty(
+                    _header_value(headers, "x-codeagents-conversation-id", "x-codeagents-session-id"),
+                    raw_args.get("conversation_id"),
+                )
+                or ""
+            ),
+            "conversation_group": (
+                _first_non_empty(
+                    _header_value(headers, "x-codeagents-conversation-group-id"),
+                    raw_args.get("conversation_group"),
+                )
+                or ""
+            ),
+            "cwd": (
+                _first_non_empty(
+                    _header_value(headers, "x-codeagents-project-path", "x-codeagents-cwd"),
+                    raw_args.get("cwd"),
+                    raw_args.get("project_path"),
+                )
+                or ""
+            ),
+        }
+
+    def _normalize_slug(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip().lower()
+        if not text:
+            return None
+        normalized: list[str] = []
+        wrote_dash = False
+        for char in text:
+            if char.isalnum():
+                normalized.append(char)
+                wrote_dash = False
+            elif char.isspace() or char in {"-", "_"}:
+                if normalized and not wrote_dash:
+                    normalized.append("-")
+                    wrote_dash = True
+        if not normalized:
+            return None
+        result = "".join(normalized).strip("-")
+        return result or None
+
+    def _compose_prompt(args: dict[str, Any]) -> str | None:
+        prompt = _first_non_empty(args.get("prompt"), args.get("text"))
+        if prompt is not None:
+            return prompt
+
+        message = _first_non_empty(args.get("message")) or ""
+        skill_slug = _first_non_empty(args.get("skill_slug"), args.get("skillSlug"), args.get("slug"))
+        skill_name = _first_non_empty(args.get("skill_name"), args.get("skillName"))
+        file_references = _to_str_array(args.get("file_references") or args.get("fileReferences"))
+        skill_command = skill_slug or _normalize_slug(skill_name)
+
+        if skill_command is not None:
+            first = f"/{skill_command}" if not message else f"/{skill_command} {message}"
+            if file_references:
+                references = "\n".join(f"@{ref}" for ref in file_references)
+                return f"{first}\n\n{references}"
+            return first
+
+        if file_references:
+            references = "\n".join(f"@{ref}" for ref in file_references)
+            if message:
+                return f"{references}\n\n{message}"
+            return references
+
+        return message or None
+
+    def _extract_schedule_payload(args: dict[str, Any]) -> dict[str, Any]:
+        nested = args.get("schedule")
+        if isinstance(nested, dict):
+            raw = dict(nested)
+        else:
+            raw = {}
+
+        for source in ("frequency", "interval", "weekday_mask", "monthly_mode", "day_of_month", "weekday_ordinal", "weekday", "month", "time_minutes"):
+            if source in raw:
+                continue
+            camel = "".join(part.capitalize() if idx else part for idx, part in enumerate(source.split("_")))
+            if source in args:
+                raw[source] = args[source]
+            elif camel in args:
+                raw[source] = args[camel]
+
+        accepted = {
+            "frequency",
+            "interval",
+            "weekday_mask",
+            "monthly_mode",
+            "day_of_month",
+            "weekday_ordinal",
+            "weekday",
+            "month",
+            "time_minutes",
+        }
+        return {key: value for key, value in raw.items() if key in accepted}
+
+    def _build_payload_from_mcp_tool_args(args: dict[str, Any], context: dict[str, str]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        title = _first_non_empty(args.get("title"))
+        if title is not None:
+            payload["title"] = title
+
+        prompt = _compose_prompt(args)
+        if prompt is not None:
+            payload["prompt"] = prompt
+
+        enabled = _to_bool(_first_non_empty(args.get("enabled"), args.get("isEnabled"), args.get("is_enabled")))
+        if enabled is not None:
+            payload["enabled"] = enabled
+
+        time_zone = _first_non_empty(
+            args.get("time_zone"),
+            args.get("timeZone"),
+            args.get("timeZoneId"),
+            args.get("time_zone_id"),
+        )
+        if time_zone is not None:
+            payload["time_zone"] = time_zone
+
+        if context.get("agent_id"):
+            payload["agent_id"] = context["agent_id"]
+        if context.get("conversation_id"):
+            payload["conversation_id"] = context["conversation_id"]
+        if context.get("conversation_group"):
+            payload["conversation_group"] = context["conversation_group"]
+        if context.get("cwd"):
+            payload["cwd"] = context["cwd"]
+
+        schedule_payload = _extract_schedule_payload(args)
+        if schedule_payload:
+            payload["schedule"] = schedule_payload
+        return payload
+
+    def _task_tools_schema() -> list[dict[str, Any]]:
+        return [
+            {
+                "name": MCP_TOOL_NAME_CREATE,
+                "description": "Create a scheduled task for the active project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "prompt": {"type": "string", "description": "Direct prompt to schedule."},
+                        "message": {"type": "string", "description": "Prompt text if direct prompt is not provided."},
+                        "isEnabled": {"type": "boolean"},
+                        "timeZoneId": {"type": "string"},
+                        "time_zone": {"type": "string"},
+                        "frequency": {"type": "string"},
+                        "interval": {"type": "integer"},
+                        "weekday_mask": {"type": "integer"},
+                        "monthly_mode": {"type": "string"},
+                        "day_of_month": {"type": "integer"},
+                        "weekday_ordinal": {"type": "string"},
+                        "weekday": {"type": "integer"},
+                        "month": {"type": "integer"},
+                        "time_minutes": {"type": "integer"},
+                        "skill_slug": {"type": "string"},
+                        "skill_name": {"type": "string"},
+                        "file_references": {"type": "array", "items": {"type": "string"}},
+                        "schedule": {"type": "object"},
+                    },
+                },
+            },
+            {
+                "name": MCP_TOOL_NAME_UPDATE,
+                "description": "Update an existing scheduled task for the active project.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["task_id"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "message": {"type": "string"},
+                        "isEnabled": {"type": "boolean"},
+                        "timeZoneId": {"type": "string"},
+                        "time_zone": {"type": "string"},
+                        "frequency": {"type": "string"},
+                        "interval": {"type": "integer"},
+                        "weekday_mask": {"type": "integer"},
+                        "monthly_mode": {"type": "string"},
+                        "day_of_month": {"type": "integer"},
+                        "weekday_ordinal": {"type": "string"},
+                        "weekday": {"type": "integer"},
+                        "month": {"type": "integer"},
+                        "time_minutes": {"type": "integer"},
+                        "skill_slug": {"type": "string"},
+                        "skill_name": {"type": "string"},
+                        "file_references": {"type": "array", "items": {"type": "string"}},
+                        "schedule": {"type": "object"},
+                    },
+                },
+            },
+            {
+                "name": MCP_TOOL_NAME_DELETE,
+                "description": "Delete a scheduled task by id.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["task_id"],
+                    "properties": {"task_id": {"type": "string"}},
+                },
+            },
+        ]
+
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
         return JSONResponse(
@@ -194,6 +472,204 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             content={"status": "ok", "version": version, "started_at": started_at},
             headers=proxy_headers(),
         )
+
+    @app.post("/mcp")
+    async def mcp_router(request: Request) -> JSONResponse:
+        try:
+            request_data = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(None, -32700, "Parse error"),
+                headers=proxy_headers(),
+            )
+
+        if not isinstance(request_data, dict):
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(None, -32600, "Invalid request"),
+                headers=proxy_headers(),
+            )
+
+        payload_id = request_data.get("id")
+        method = request_data.get("method")
+        if not isinstance(method, str):
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(payload_id, -32600, "Missing or invalid method"),
+                headers=proxy_headers(),
+            )
+
+        if method == "initialize":
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_result(
+                    payload_id,
+                    {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {
+                            "tools": {
+                                "listChanged": False,
+                            }
+                        },
+                        "serverInfo": {
+                            "name": MCP_SERVER_NAME,
+                            "version": MCP_SERVER_VERSION,
+                        },
+                    },
+                ),
+                headers=proxy_headers(),
+            )
+
+        if method == "tools/list":
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_result(
+                    payload_id,
+                    {"tools": _task_tools_schema()},
+                ),
+                headers=proxy_headers(),
+            )
+
+        if method != "tools/call":
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(payload_id, -32601, f"Method '{method}' not found"),
+                headers=proxy_headers(),
+            )
+
+        params = request_data.get("params")
+        if not isinstance(params, dict):
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(payload_id, -32602, "Invalid params"),
+                headers=proxy_headers(),
+            )
+
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        if not isinstance(tool_name, str):
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(payload_id, -32602, "Missing tool name"),
+                headers=proxy_headers(),
+            )
+        if not isinstance(arguments, dict):
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_error(payload_id, -32602, "Tool arguments must be an object"),
+                headers=proxy_headers(),
+            )
+
+        context = _resolve_mcp_scope(request, arguments)
+        scoped_payload = _build_payload_from_mcp_tool_args(arguments, context)
+
+        if tool_name == MCP_TOOL_NAME_CREATE:
+            try:
+                record = parse_task_payload(scoped_payload)
+            except (TaskValidationError, ValueError) as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, str(exc)),
+                    headers=proxy_headers(),
+                )
+
+            stored = await task_scheduler.create_task(record)
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_result(
+                    payload_id,
+                    {
+                        "task": serialize_task(stored),
+                    },
+                ),
+                headers=proxy_headers(),
+            )
+
+        if tool_name == MCP_TOOL_NAME_UPDATE:
+            task_id = arguments.get("task_id")
+            if not isinstance(task_id, str) or not task_id.strip():
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, "task_id is required"),
+                    headers=proxy_headers(),
+                )
+
+            try:
+                task_id = sanitize_id(task_id)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, str(exc)),
+                    headers=proxy_headers(),
+                )
+
+            existing = await task_store.get_task(task_id)
+            if existing is None:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32000, "Task not found"),
+                    headers=proxy_headers(),
+                )
+
+            try:
+                updated = update_task_from_payload(existing, scoped_payload)
+            except (TaskValidationError, ValueError) as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, str(exc)),
+                    headers=proxy_headers(),
+                )
+
+            stored = await task_scheduler.update_task(task_id, updated)
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_result(
+                    payload_id,
+                    {
+                        "task": serialize_task(stored),
+                    },
+                ),
+                headers=proxy_headers(),
+            )
+
+        if tool_name == MCP_TOOL_NAME_DELETE:
+            task_id = arguments.get("task_id")
+            if not isinstance(task_id, str) or not task_id.strip():
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, "task_id is required"),
+                    headers=proxy_headers(),
+                )
+
+            try:
+                task_id = sanitize_id(task_id)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, str(exc)),
+                    headers=proxy_headers(),
+                )
+
+            existing = await task_store.get_task(task_id)
+            if existing is None:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32000, "Task not found"),
+                    headers=proxy_headers(),
+                )
+
+            await task_scheduler.delete_task(task_id)
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_result(
+                    payload_id,
+                    {
+                        "ok": True,
+                    },
+                ),
+                headers=proxy_headers(),
+            )
 
     @app.get("/v1/conversations/canonical")
     async def canonical_conversation(request: Request) -> JSONResponse:

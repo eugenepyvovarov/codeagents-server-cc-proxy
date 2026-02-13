@@ -187,6 +187,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             headers=headers,
         )
 
+    MCP_TOOL_NAME_LIST = "list_scheduled_tasks"
     MCP_TOOL_NAME_CREATE = "create_scheduled_task"
     MCP_TOOL_NAME_UPDATE = "update_scheduled_task"
     MCP_TOOL_NAME_DELETE = "delete_scheduled_task"
@@ -276,6 +277,16 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                     _header_value(headers, "x-codeagents-project-path", "x-codeagents-cwd"),
                     raw_args.get("cwd"),
                     raw_args.get("project_path"),
+                )
+                or ""
+            ),
+            "time_zone": (
+                _first_non_empty(
+                    _header_value(headers, "x-codeagents-time-zone", "x-codeagents-timezone"),
+                    raw_args.get("time_zone"),
+                    raw_args.get("timeZone"),
+                    raw_args.get("timeZoneId"),
+                    raw_args.get("time_zone_id"),
                 )
                 or ""
             ),
@@ -377,6 +388,8 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             args.get("timeZoneId"),
             args.get("time_zone_id"),
         )
+        if time_zone is None and context.get("time_zone"):
+            time_zone = context["time_zone"]
         if time_zone is not None:
             payload["time_zone"] = time_zone
 
@@ -396,6 +409,17 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
 
     def _task_tools_schema() -> list[dict[str, Any]]:
         return [
+            {
+                "name": MCP_TOOL_NAME_LIST,
+                "description": "List scheduled tasks for the active project.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean", "description": "Optional filter by enabled state."},
+                        "limit": {"type": "integer", "description": "Optional max tasks to return (1-200)."},
+                    },
+                },
+            },
             {
                 "name": MCP_TOOL_NAME_CREATE,
                 "description": "Create a scheduled task for the active project.",
@@ -563,6 +587,69 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
 
         context = _resolve_mcp_scope(request, arguments)
         scoped_payload = _build_payload_from_mcp_tool_args(arguments, context)
+
+        if tool_name == MCP_TOOL_NAME_LIST:
+            agent_id = context.get("agent_id", "")
+            if not agent_id:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, "Missing active project context (agent_id)"),
+                    headers=proxy_headers(),
+                )
+
+            try:
+                agent_id = sanitize_id(agent_id)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(payload_id, -32602, str(exc)),
+                    headers=proxy_headers(),
+                )
+
+            enabled_filter = _to_bool(_first_non_empty(arguments.get("enabled"), arguments.get("isEnabled"), arguments.get("is_enabled")))
+
+            limit_value = arguments.get("limit")
+            limit: int | None = None
+            if limit_value is not None:
+                if isinstance(limit_value, bool):
+                    return JSONResponse(
+                        status_code=200,
+                        content=_mcp_error(payload_id, -32602, "limit must be an integer between 1 and 200"),
+                        headers=proxy_headers(),
+                    )
+                if isinstance(limit_value, int):
+                    limit = limit_value
+                elif isinstance(limit_value, float) and limit_value.is_integer():
+                    limit = int(limit_value)
+                elif isinstance(limit_value, str):
+                    normalized = limit_value.strip()
+                    if normalized.isdigit():
+                        limit = int(normalized)
+                if limit is None or limit < 1 or limit > 200:
+                    return JSONResponse(
+                        status_code=200,
+                        content=_mcp_error(payload_id, -32602, "limit must be an integer between 1 and 200"),
+                        headers=proxy_headers(),
+                    )
+
+            tasks = await task_store.list_tasks(agent_id=agent_id)
+            if enabled_filter is not None:
+                tasks = [task for task in tasks if task.enabled is enabled_filter]
+            if limit is not None:
+                tasks = tasks[:limit]
+
+            serialized = [serialize_task(task) for task in tasks]
+            return JSONResponse(
+                status_code=200,
+                content=_mcp_result(
+                    payload_id,
+                    {
+                        "tasks": serialized,
+                        "count": len(serialized),
+                    },
+                ),
+                headers=proxy_headers(),
+            )
 
         if tool_name == MCP_TOOL_NAME_CREATE:
             try:

@@ -680,6 +680,17 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 tasks = tasks[:limit]
 
             serialized = [serialize_task(task) for task in tasks]
+            if serialized:
+                lines = [f"Found {len(serialized)} scheduled task(s):"]
+                for task in serialized:
+                    task_id = str(task.get("id", "")).strip()
+                    title = str(task.get("title", "")).strip() or "(untitled)"
+                    status = "enabled" if task.get("enabled") else "disabled"
+                    lines.append(f"- {title} [{task_id}] ({status})")
+                text = "\n".join(lines)
+            else:
+                text = "No scheduled tasks found."
+
             return JSONResponse(
                 status_code=200,
                 content=_mcp_result(
@@ -687,6 +698,16 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                     {
                         "tasks": serialized,
                         "count": len(serialized),
+                        "structuredContent": {
+                            "tasks": serialized,
+                            "count": len(serialized),
+                        },
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": text,
+                            }
+                        ],
                     },
                 ),
                 headers=proxy_headers(),

@@ -589,20 +589,24 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         scoped_payload = _build_payload_from_mcp_tool_args(arguments, context)
 
         if tool_name == MCP_TOOL_NAME_LIST:
-            agent_id = context.get("agent_id", "")
-            if not agent_id:
-                return JSONResponse(
-                    status_code=200,
-                    content=_mcp_error(payload_id, -32602, "Missing active project context (agent_id)"),
-                    headers=proxy_headers(),
-                )
+            raw_agent_id = context.get("agent_id", "")
+            cwd = (context.get("cwd", "") or "").strip()
+            agent_id: str | None = None
 
-            try:
-                agent_id = sanitize_id(agent_id)
-            except ValueError as exc:
+            if raw_agent_id:
+                try:
+                    agent_id = sanitize_id(raw_agent_id)
+                except ValueError as exc:
+                    return JSONResponse(
+                        status_code=200,
+                        content=_mcp_error(payload_id, -32602, str(exc)),
+                        headers=proxy_headers(),
+                    )
+
+            if not agent_id and not cwd:
                 return JSONResponse(
                     status_code=200,
-                    content=_mcp_error(payload_id, -32602, str(exc)),
+                    content=_mcp_error(payload_id, -32602, "Missing active project context (agent_id/cwd)"),
                     headers=proxy_headers(),
                 )
 
@@ -632,7 +636,19 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                         headers=proxy_headers(),
                     )
 
-            tasks = await task_store.list_tasks(agent_id=agent_id)
+            if agent_id:
+                tasks = await task_store.list_tasks(agent_id=agent_id)
+                if cwd:
+                    tasks = [task for task in tasks if task.cwd == cwd]
+                    if not tasks:
+                        # Identity can drift between legacy and current clients.
+                        # Fall back to project-path scope to avoid false "no tasks".
+                        all_tasks = await task_store.list_tasks()
+                        tasks = [task for task in all_tasks if task.cwd == cwd]
+            else:
+                all_tasks = await task_store.list_tasks()
+                tasks = [task for task in all_tasks if task.cwd == cwd]
+
             if enabled_filter is not None:
                 tasks = [task for task in tasks if task.enabled is enabled_filter]
             if limit is not None:

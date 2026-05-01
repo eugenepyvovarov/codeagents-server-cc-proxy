@@ -4,6 +4,7 @@ import os
 import shlex
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import quote
 
 import httpx
 
@@ -131,3 +132,66 @@ class OpenCodeClient:
             "healthy": bool(health.get("healthy")),
             "version": health.get("version"),
         }
+
+    async def create_session(
+        self,
+        *,
+        title: str | None = None,
+        parent_id: str | None = None,
+        directory: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if title:
+            payload["title"] = title
+        if parent_id:
+            payload["parentID"] = parent_id
+
+        response = await self.request(
+            "POST",
+            "/session",
+            json=payload,
+            params={"directory": directory} if directory else None,
+        )
+        if not isinstance(response, dict):
+            raise ValueError("OpenCode create session response must be an object")
+        return response
+
+    async def session_status(self, *, directory: str | None = None) -> dict[str, Any]:
+        response = await self.request(
+            "GET",
+            "/session/status",
+            params={"directory": directory} if directory else None,
+        )
+        if not isinstance(response, dict):
+            raise ValueError("OpenCode session status response must be an object")
+        return response
+
+    async def prompt_async(self, *, session_id: str, prompt: str, directory: str | None = None) -> None:
+        await self.request(
+            "POST",
+            f"/session/{quote(session_id, safe='')}/prompt_async",
+            json={"parts": [{"type": "text", "text": prompt}]},
+            params={"directory": directory} if directory else None,
+        )
+
+    async def session_messages(
+        self,
+        *,
+        session_id: str,
+        directory: str | None = None,
+        limit: int | None = None,
+    ) -> list[Any]:
+        params: dict[str, Any] = {}
+        if directory:
+            params["directory"] = directory
+        if limit is not None:
+            params["limit"] = limit
+
+        response = await self.request(
+            "GET",
+            f"/session/{quote(session_id, safe='')}/message",
+            params=params or None,
+        )
+        if not isinstance(response, list):
+            raise ValueError("OpenCode session messages response must be an array")
+        return response

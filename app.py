@@ -21,6 +21,7 @@ from claude_proxy.conversation_manager import (
     ConversationManager,
 )
 from claude_proxy.opencode_client import OpenCodeClient
+from claude_proxy.opencode_tasks import OpenCodeTaskRunner
 from claude_proxy.task_scheduler import (
     TaskScheduler,
     TaskStore,
@@ -121,8 +122,9 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     store_root = (store_dir or Path("data")).resolve()
     task_store = TaskStore(store_root / "tasks.db")
     manager = ConversationManager(store_dir=store_dir, backend=backend, env_store=task_store)
-    task_scheduler = TaskScheduler(store=task_store, manager=manager)
     opencode_client = OpenCodeClient.from_environment()
+    opencode_task_runner = OpenCodeTaskRunner(client=opencode_client, store=task_store)
+    task_scheduler = TaskScheduler(store=task_store, manager=manager, task_runner=opencode_task_runner)
     manager.set_run_finished_callback(task_scheduler.on_run_finished)
     update_lock = asyncio.Lock()
     update_task: asyncio.Task[None] | None = None
@@ -143,7 +145,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if update_lock.locked():
             return
         async with update_lock:
-            if await manager.has_active_runs():
+            if await manager.has_active_runs() or await opencode_task_runner.has_active_runs():
                 logger.info("Auto-update: skipping because a run is active")
                 return
             repo_dir = Path(__file__).resolve().parent

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import httpx
@@ -77,6 +78,40 @@ async def test_health_status_reports_unavailable_on_error():
 
     assert status["healthy"] is False
     assert "503" in status["error"]
+
+
+@pytest.mark.asyncio
+async def test_session_endpoints_include_directory_and_encode_session_id():
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raw_path = request.url.raw_path.decode("utf-8").split("?", 1)[0]
+        if raw_path == "/session":
+            assert request.url.params["directory"] == "/tmp/project"
+            return httpx.Response(200, json={"id": "ses_fixture"})
+        if raw_path == "/session/status":
+            assert request.url.params["directory"] == "/tmp/project"
+            return httpx.Response(200, json={"ses_fixture": {"type": "idle"}})
+        if raw_path == "/session/ses%2Ffixture/prompt_async":
+            assert request.url.params["directory"] == "/tmp/project"
+            assert json.loads(request.content.decode("utf-8")) == {
+                "parts": [{"type": "text", "text": "hello"}]
+            }
+            return httpx.Response(200)
+        if raw_path == "/session/ses%2Ffixture/message":
+            assert request.url.params["directory"] == "/tmp/project"
+            assert request.url.params["limit"] == "10"
+            return httpx.Response(200, json=[])
+        return httpx.Response(404, json={"error": "unexpected"})
+
+    client = OpenCodeClient(transport=httpx.MockTransport(handler))
+
+    assert await client.create_session(title="Fixture", directory="/tmp/project") == {"id": "ses_fixture"}
+    assert await client.session_status(directory="/tmp/project") == {"ses_fixture": {"type": "idle"}}
+    await client.prompt_async(session_id="ses/fixture", prompt="hello", directory="/tmp/project")
+    assert await client.session_messages(session_id="ses/fixture", directory="/tmp/project", limit=10) == []
+    assert [request.method for request in requests] == ["POST", "GET", "POST", "GET"]
 
 
 @pytest.mark.asyncio

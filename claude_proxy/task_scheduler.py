@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -261,9 +262,12 @@ def parse_task_payload(payload: dict[str, Any]) -> TaskRecord:
         raise TaskValidationError("agent_id is required")
     agent_id = sanitize_id(agent_id)
 
-    conversation_id = _sanitize_string(payload.get("conversation_id") or payload.get("session_id"), "conversation_id")
+    conversation_id = _sanitize_string(
+        payload.get("conversation_id") or payload.get("session_id") or payload.get("open_code_session_id"),
+        "conversation_id",
+    )
     if not conversation_id:
-        raise TaskValidationError("conversation_id is required")
+        conversation_id = f"scheduled-{agent_id}"
     conversation_id = sanitize_id(conversation_id)
 
     conversation_group = _sanitize_string(payload.get("conversation_group"), "conversation_group")
@@ -485,6 +489,18 @@ class TaskStore:
                     PRIMARY KEY (agent_id, env_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_env_agent_id ON agent_env_vars(agent_id);
+
+                CREATE TABLE IF NOT EXISTS opencode_sessions (
+                    session_key TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    conversation_group TEXT,
+                    cwd TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_opencode_sessions_agent_id ON opencode_sessions(agent_id);
                 """
             )
 
@@ -561,6 +577,129 @@ class TaskStore:
                 (agent_id,),
             ).fetchall()
         return {row["env_key"]: row["value"] for row in rows}
+
+    async def get_opencode_session(
+        self,
+        *,
+        agent_id: str,
+        conversation_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> str | None:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_opencode_session_sync,
+                agent_id,
+                conversation_id,
+                conversation_group,
+                cwd,
+            )
+
+    def _get_opencode_session_sync(
+        self,
+        agent_id: str,
+        conversation_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> str | None:
+        session_key = self._opencode_session_key(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM opencode_sessions WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["session_id"]
+
+    async def save_opencode_session(
+        self,
+        *,
+        agent_id: str,
+        conversation_id: str,
+        conversation_group: str | None,
+        cwd: str,
+        session_id: str,
+    ) -> None:
+        async with self._lock:
+            await asyncio.to_thread(
+                self._save_opencode_session_sync,
+                agent_id,
+                conversation_id,
+                conversation_group,
+                cwd,
+                session_id,
+            )
+
+    def _save_opencode_session_sync(
+        self,
+        agent_id: str,
+        conversation_id: str,
+        conversation_group: str | None,
+        cwd: str,
+        session_id: str,
+    ) -> None:
+        session_key = self._opencode_session_key(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+        )
+        now = _iso_utc(_now_utc())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO opencode_sessions (
+                    session_key,
+                    agent_id,
+                    conversation_id,
+                    conversation_group,
+                    cwd,
+                    session_id,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_key,
+                    agent_id,
+                    conversation_id,
+                    conversation_group,
+                    cwd,
+                    session_id,
+                    now,
+                    now,
+                ),
+            )
+
+    def _opencode_session_key(
+        self,
+        *,
+        agent_id: str,
+        conversation_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> str:
+        identity = json.dumps(
+            {
+                "agent_id": agent_id,
+                "conversation_id": conversation_id,
+                "conversation_group": conversation_group or "",
+                "cwd": cwd,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     async def list_tasks(
         self,
@@ -831,12 +970,22 @@ class TaskStore:
 
 
 class TaskScheduler:
-    def __init__(self, *, store: TaskStore, manager: ConversationManager) -> None:
+    def __init__(
+        self,
+        *,
+        store: TaskStore,
+        manager: ConversationManager | None = None,
+        task_runner: Any = None,
+    ) -> None:
         self._store = store
         self._manager = manager
+        self._task_runner = task_runner or manager
+        if self._task_runner is None:
+            raise ValueError("TaskScheduler requires manager or task_runner.")
         self._scheduler = AsyncIOScheduler(timezone=timezone.utc)
         self._lock = asyncio.Lock()
         self._started = False
+        self._pending_retry_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
         async with self._lock:
@@ -851,6 +1000,9 @@ class TaskScheduler:
             if not self._started:
                 return
             self._scheduler.shutdown(wait=False)
+            for retry_task in self._pending_retry_tasks.values():
+                retry_task.cancel()
+            self._pending_retry_tasks.clear()
             self._started = False
 
     async def reload(self) -> None:
@@ -933,6 +1085,8 @@ class TaskScheduler:
             return
 
         await self._store.update_run_times(task_id, last_run_at=_now_utc(), last_error=None)
+        if getattr(self._task_runner, "start_run_waits_for_completion", False):
+            await self._drain_pending(task.cwd)
 
     async def _schedule_next(self, task: TaskRecord, scheduled_at: datetime) -> None:
         next_run = compute_next_run(task, after=scheduled_at)
@@ -957,7 +1111,7 @@ class TaskScheduler:
         if task.conversation_group:
             request_body.setdefault("conversation_group", task.conversation_group)
         conversation_id = await self._resolve_task_conversation_id(task)
-        return await self._manager.start_run(
+        return await self._task_runner.start_run(
             conversation_id=conversation_id,
             prompt=task.prompt,
             request_body=request_body,
@@ -965,11 +1119,20 @@ class TaskScheduler:
 
     async def _resolve_task_conversation_id(self, task: TaskRecord) -> str:
         try:
-            return await self._manager.resolve_conversation_id(
-                conversation_id=task.conversation_id,
-                cwd=task.cwd,
-                conversation_group=task.conversation_group,
-            )
+            if self._manager is not None:
+                return await self._manager.resolve_conversation_id(
+                    conversation_id=task.conversation_id,
+                    cwd=task.cwd,
+                    conversation_group=task.conversation_group,
+                )
+            resolver = getattr(self._task_runner, "resolve_conversation_id", None)
+            if resolver is not None:
+                return await resolver(
+                    conversation_id=task.conversation_id,
+                    cwd=task.cwd,
+                    conversation_group=task.conversation_group,
+                )
+            return task.conversation_id
         except Exception as exc:
             logger.warning("Task %s conversation resolution failed: %s", task.id, exc)
             return task.conversation_id
@@ -988,6 +1151,23 @@ class TaskScheduler:
             enqueued_at=_now_utc(),
         )
         await self._store.enqueue_pending(pending)
+        if getattr(self._task_runner, "start_run_waits_for_completion", False):
+            self._schedule_pending_retry(task.cwd)
+
+    def _schedule_pending_retry(self, cwd: str) -> None:
+        existing = self._pending_retry_tasks.get(cwd)
+        if existing is not None and not existing.done():
+            return
+        self._pending_retry_tasks[cwd] = asyncio.create_task(self._retry_pending_later(cwd))
+
+    async def _retry_pending_later(self, cwd: str) -> None:
+        try:
+            await asyncio.sleep(10)
+            await self._drain_pending(cwd)
+        finally:
+            current = self._pending_retry_tasks.get(cwd)
+            if current is asyncio.current_task():
+                self._pending_retry_tasks.pop(cwd, None)
 
     async def _drain_pending(self, cwd: str) -> None:
         while True:
@@ -1003,6 +1183,8 @@ class TaskScheduler:
                 started = await self._start_task_run(task)
             except AgentFolderBusyError:
                 await self._store.enqueue_pending(pending)
+                if getattr(self._task_runner, "start_run_waits_for_completion", False):
+                    self._schedule_pending_retry(task.cwd)
                 return
             except Exception as exc:
                 logger.exception("Pending run failed: %s", pending.task_id)
@@ -1011,6 +1193,8 @@ class TaskScheduler:
 
             if not started:
                 await self._store.enqueue_pending(pending)
+                if getattr(self._task_runner, "start_run_waits_for_completion", False):
+                    self._schedule_pending_retry(task.cwd)
                 return
 
             await self._store.update_run_times(task.id, last_run_at=_now_utc(), last_error=None)

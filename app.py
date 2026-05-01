@@ -20,6 +20,7 @@ from claude_proxy.conversation_manager import (
     ConversationGroupMismatchError,
     ConversationManager,
 )
+from claude_proxy.opencode_client import OpenCodeClient
 from claude_proxy.task_scheduler import (
     TaskScheduler,
     TaskStore,
@@ -121,6 +122,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     task_store = TaskStore(store_root / "tasks.db")
     manager = ConversationManager(store_dir=store_dir, backend=backend, env_store=task_store)
     task_scheduler = TaskScheduler(store=task_store, manager=manager)
+    opencode_client = OpenCodeClient.from_environment()
     manager.set_run_finished_callback(task_scheduler.on_run_finished)
     update_lock = asyncio.Lock()
     update_task: asyncio.Task[None] | None = None
@@ -525,7 +527,12 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     async def healthz() -> JSONResponse:
         return JSONResponse(
             status_code=200,
-            content={"status": "ok", "version": version, "started_at": started_at},
+            content={
+                "status": "ok",
+                "version": version,
+                "started_at": started_at,
+                "opencode": await opencode_client.health_status(),
+            },
             headers=proxy_headers(),
         )
 

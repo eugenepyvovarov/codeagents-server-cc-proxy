@@ -5,6 +5,9 @@ REPO_URL="${REPO_URL:-https://github.com/eugenepyvovarov/codeagents-server-cc-pr
 INSTALL_DIR="${INSTALL_DIR:-/opt/claude-proxy}"
 DATA_DIR="${DATA_DIR:-/opt/claude-proxy/data}"
 LOG_DIR="${LOG_DIR:-/var/log/claude-proxy}"
+SERVICE_NAME="${SERVICE_NAME:-claude-proxy}"
+LAUNCHD_LABEL="${LAUNCHD_LABEL:-com.codeagents.$SERVICE_NAME}"
+INSTALL_CLAUDE_CLI="${INSTALL_CLAUDE_CLI:-1}"
 
 log_step() {
   step="$1"
@@ -94,6 +97,13 @@ setup_venv() {
 }
 
 install_claude_cli() {
+  case "$INSTALL_CLAUDE_CLI" in
+    0|false|FALSE|no|NO)
+      log_step "claude_cli" "ok" "msg=\"skipped\""
+      return 0
+      ;;
+  esac
+
   if ! command_exists npm; then
     fail "node" "npm not found"
   fi
@@ -160,17 +170,18 @@ setup_supervisor_program() {
 
   mkdir -p "$LOG_DIR"
   template="$INSTALL_DIR/deploy/supervisord/claude-proxy.conf"
-  target="$conf_dir/claude-proxy.conf"
+  target="$conf_dir/$SERVICE_NAME.conf"
 
   sed \
     -e "s#__INSTALL_DIR__#$INSTALL_DIR#g" \
     -e "s#__LOG_DIR__#$LOG_DIR#g" \
+    -e "s#__SERVICE_NAME__#$SERVICE_NAME#g" \
     "$template" > "$target"
 
   start_supervisord
   supervisorctl reread
   supervisorctl update
-  supervisorctl restart claude-proxy
+  supervisorctl restart "$SERVICE_NAME"
 }
 
 install_linux_packages() {
@@ -317,17 +328,19 @@ install_macos() {
 
   mkdir -p "$LOG_DIR"
   template="$INSTALL_DIR/deploy/launchd/com.codeagents.claude-proxy.plist"
-  target="/Library/LaunchDaemons/com.codeagents.claude-proxy.plist"
+  target="/Library/LaunchDaemons/$LAUNCHD_LABEL.plist"
 
   sed \
     -e "s#__INSTALL_DIR__#$INSTALL_DIR#g" \
     -e "s#__LOG_DIR__#$LOG_DIR#g" \
     -e "s#__BREW_PREFIX__#$brew_prefix#g" \
+    -e "s#__SERVICE_NAME__#$SERVICE_NAME#g" \
+    -e "s#__LAUNCHD_LABEL__#$LAUNCHD_LABEL#g" \
     "$template" > "$target"
 
   /bin/launchctl bootout system "$target" >/dev/null 2>&1 || true
   /bin/launchctl bootstrap system "$target"
-  /bin/launchctl kickstart -k system/com.codeagents.claude-proxy
+  /bin/launchctl kickstart -k "system/$LAUNCHD_LABEL"
 
   ensure_healthz
 }

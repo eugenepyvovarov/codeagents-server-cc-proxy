@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.codeagents.claude-proxy</string>
+  <string>__LAUNCHD_LABEL__</string>
   <key>ProgramArguments</key>
   <array>
     <string>__INSTALL_DIR__/.venv/bin/python</string>
@@ -31,8 +31,8 @@
     <string>1</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>__LOG_DIR__/claude-proxy.log</string>
+  <string>__LOG_DIR__/__SERVICE_NAME__.log</string>
   <key>StandardErrorPath</key>
-  <string>__LOG_DIR__/claude-proxy.err.log</string>
+  <string>__LOG_DIR__/__SERVICE_NAME__.err.log</string>
 </dict>
 </plist>

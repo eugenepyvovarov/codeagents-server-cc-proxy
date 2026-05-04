@@ -204,8 +204,8 @@ install_linux_packages() {
 
   case "$pkg" in
     apt)
-      apt-get update -y
-      apt-get install -y curl ca-certificates git python3 python3-venv python3-pip supervisor $node_packages
+      timeout --kill-after=10 180 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2 update -y
+      timeout --kill-after=10 180 apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o Acquire::Retries=2 install -y --no-install-recommends curl ca-certificates git python3 python3-venv python3-pip supervisor $node_packages
       ;;
     dnf)
       dnf install -y curl ca-certificates git python3 python3-pip supervisor $node_packages

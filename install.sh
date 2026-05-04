@@ -110,6 +110,17 @@ install_claude_cli() {
   npm install -g @anthropic-ai/claude-code
 }
 
+should_install_claude_cli() {
+  case "$INSTALL_CLAUDE_CLI" in
+    0|false|FALSE|no|NO)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 ensure_healthz() {
   if ! command_exists curl; then
     fail "healthz" "curl not found"
@@ -186,20 +197,24 @@ setup_supervisor_program() {
 
 install_linux_packages() {
   pkg="$1"
+  node_packages=""
+  if should_install_claude_cli; then
+    node_packages="nodejs npm"
+  fi
 
   case "$pkg" in
     apt)
       apt-get update -y
-      apt-get install -y curl ca-certificates git build-essential python3 python3-venv python3-pip nodejs npm supervisor
+      apt-get install -y curl ca-certificates git build-essential python3 python3-venv python3-pip supervisor $node_packages
       ;;
     dnf)
-      dnf install -y curl ca-certificates git gcc make python3 python3-pip nodejs npm supervisor
+      dnf install -y curl ca-certificates git gcc make python3 python3-pip supervisor $node_packages
       ;;
     yum)
-      yum install -y curl ca-certificates git gcc make python3 python3-pip nodejs npm supervisor
+      yum install -y curl ca-certificates git gcc make python3 python3-pip supervisor $node_packages
       ;;
     pacman)
-      pacman -Sy --noconfirm curl ca-certificates git base-devel python python-pip nodejs npm supervisor
+      pacman -Sy --noconfirm curl ca-certificates git base-devel python python-pip supervisor $node_packages
       ;;
     *)
       fail "packages" "unsupported package manager"
@@ -315,7 +330,11 @@ install_macos() {
   brew_bin=$(ensure_brew)
   brew_user="${SUDO_USER:-root}"
 
-  run_as_user "$brew_user" "$brew_bin" install python@3.11 node
+  brew_packages="python@3.11"
+  if should_install_claude_cli; then
+    brew_packages="$brew_packages node"
+  fi
+  run_as_user "$brew_user" "$brew_bin" install $brew_packages
 
   brew_prefix=$(run_as_user "$brew_user" "$brew_bin" --prefix)
   export PATH="$brew_prefix/bin:$brew_prefix/sbin:/usr/bin:/bin:/usr/sbin:/sbin"

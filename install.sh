@@ -205,16 +205,16 @@ install_linux_packages() {
   case "$pkg" in
     apt)
       apt-get update -y
-      apt-get install -y curl ca-certificates git build-essential python3 python3-venv python3-pip supervisor $node_packages
+      apt-get install -y curl ca-certificates git python3 python3-venv python3-pip supervisor $node_packages
       ;;
     dnf)
-      dnf install -y curl ca-certificates git gcc make python3 python3-pip supervisor $node_packages
+      dnf install -y curl ca-certificates git python3 python3-pip supervisor $node_packages
       ;;
     yum)
-      yum install -y curl ca-certificates git gcc make python3 python3-pip supervisor $node_packages
+      yum install -y curl ca-certificates git python3 python3-pip supervisor $node_packages
       ;;
     pacman)
-      pacman -Sy --noconfirm curl ca-certificates git base-devel python python-pip supervisor $node_packages
+      pacman -Sy --noconfirm curl ca-certificates git python python-pip supervisor $node_packages
       ;;
     *)
       fail "packages" "unsupported package manager"

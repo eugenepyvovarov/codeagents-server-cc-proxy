@@ -1015,13 +1015,13 @@ class TaskScheduler:
     async def create_task(self, record: TaskRecord) -> TaskRecord:
         stored = await self._store.create_task(record)
         if stored.enabled:
-            await self._schedule_task(stored, force=True)
+            return await self._schedule_task(stored, force=True)
         return stored
 
     async def update_task(self, task_id: str, record: TaskRecord) -> TaskRecord:
         stored = await self._store.update_task(task_id, record)
         if stored.enabled:
-            await self._schedule_task(stored, force=True)
+            return await self._schedule_task(stored, force=True)
         else:
             try:
                 self._scheduler.remove_job(stored.id)
@@ -1039,7 +1039,7 @@ class TaskScheduler:
     async def on_run_finished(self, cwd: str) -> None:
         await self._drain_pending(cwd)
 
-    async def _schedule_task(self, task: TaskRecord, *, force: bool) -> None:
+    async def _schedule_task(self, task: TaskRecord, *, force: bool) -> TaskRecord:
         now = _now_utc()
         next_run = task.next_run_at
         if force or next_run is None or next_run <= now:
@@ -1062,6 +1062,7 @@ class TaskScheduler:
             replace_existing=True,
             misfire_grace_time=300,
         )
+        return task
 
     async def _run_task_job(self, task_id: str, scheduled_at: datetime) -> None:
         task = await self._store.get_task(task_id)

@@ -39,7 +39,7 @@ def _normalize_preview(text: str, max_len: int = 600) -> str | None:
     return collapsed[:slice_len].rstrip() + "…"
 
 
-def _post_json(url: str, *, secret: str, payload: dict[str, Any]) -> None:
+def _post_json(url: str, *, secret: str, payload: dict[str, Any]) -> dict[str, Any]:
     data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
         url=url,
@@ -51,7 +51,14 @@ def _post_json(url: str, *, secret: str, payload: dict[str, Any]) -> None:
         },
     )
     with urllib.request.urlopen(request, timeout=2.5) as response:
-        _ = response.read()
+        raw = response.read()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 async def trigger_reply_finished(
@@ -64,6 +71,15 @@ async def trigger_reply_finished(
     secret = _env("CODEAGENTS_PUSH_SECRET")
     base_url = _env("CODEAGENTS_PUSH_GATEWAY_BASE_URL")
     if not secret or not base_url:
+        missing = [
+            name
+            for name, value in (
+                ("CODEAGENTS_PUSH_SECRET", secret),
+                ("CODEAGENTS_PUSH_GATEWAY_BASE_URL", base_url),
+            )
+            if not value
+        ]
+        logger.info("Push trigger skipped: missing %s", ", ".join(missing))
         return
 
     url = _build_url(base_url, "triggerReplyFinished")
@@ -78,7 +94,15 @@ async def trigger_reply_finished(
             payload["message_preview"] = normalized
 
     try:
-        await asyncio.to_thread(_post_json, url, secret=secret, payload=payload)
+        result = await asyncio.to_thread(_post_json, url, secret=secret, payload=payload)
+        attempted = result.get("attempted")
+        sent = result.get("sent")
+        if attempted == 0:
+            logger.info("Push trigger completed with no registered devices for cwd=%s", cwd)
+        elif isinstance(attempted, int) and isinstance(sent, int) and sent <= 0:
+            logger.warning("Push trigger sent 0/%s notifications for cwd=%s", attempted, cwd)
+        elif isinstance(attempted, int) and isinstance(sent, int):
+            logger.info("Push trigger sent %s/%s notifications for cwd=%s", sent, attempted, cwd)
     except urllib.error.HTTPError as exc:
         logger.warning("Push trigger HTTP error: %s", getattr(exc, "code", "unknown"))
     except Exception:

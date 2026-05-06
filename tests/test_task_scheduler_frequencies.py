@@ -1,8 +1,24 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
-from claude_proxy.task_scheduler import TaskRecord, TaskSchedule, compute_next_run, parse_task_payload
+from claude_proxy.task_scheduler import (
+    TaskRecord,
+    TaskSchedule,
+    TaskScheduler,
+    TaskStore,
+    compute_next_run,
+    parse_task_payload,
+)
+
+
+class NoopTaskRunner:
+    async def start_run(self, *, conversation_id: str, prompt: str, request_body: dict) -> bool:
+        _ = conversation_id
+        _ = prompt
+        _ = request_body
+        return True
 
 
 def _task_record(*, time_zone: str, schedule: TaskSchedule, anchor_at: datetime) -> TaskRecord:
@@ -88,3 +104,43 @@ def test_compute_next_run_hourly_keeps_fixed_cadence_when_interval_not_divisor()
 
     assert first == datetime(2026, 1, 30, 23, 0, 0, tzinfo=timezone.utc)
     assert (second - first).total_seconds() == pytest.approx(23 * 3600)
+
+
+@pytest.mark.asyncio
+async def test_create_and_update_return_scheduled_next_run(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    scheduler = TaskScheduler(store=store, task_runner=NoopTaskRunner())
+    await scheduler.start()
+    try:
+        record = parse_task_payload(
+            {
+                "agent_id": "agent-123",
+                "conversation_id": "conv-123",
+                "cwd": "/tmp/project",
+                "prompt": "scheduled ping",
+                "enabled": True,
+                "time_zone": "UTC",
+                "schedule": {"frequency": "hourly", "interval": 1},
+            }
+        )
+
+        created = await scheduler.create_task(record)
+
+        assert created.next_run_at is not None
+        persisted = await store.get_task(created.id)
+        assert persisted is not None
+        assert persisted.next_run_at == created.next_run_at
+
+        updated_record = replace(
+            created,
+            schedule=replace(created.schedule, frequency="minutely", interval=30),
+            next_run_at=None,
+        )
+        updated = await scheduler.update_task(created.id, updated_record)
+
+        assert updated.next_run_at is not None
+        persisted = await store.get_task(created.id)
+        assert persisted is not None
+        assert persisted.next_run_at == updated.next_run_at
+    finally:
+        await scheduler.shutdown()

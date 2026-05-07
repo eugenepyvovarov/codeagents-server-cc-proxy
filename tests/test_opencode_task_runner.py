@@ -148,6 +148,89 @@ async def test_opencode_task_runner_defers_when_session_is_busy(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_opencode_task_runner_prefers_active_session_over_legacy_explicit_session(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    await store.save_active_opencode_session(
+        agent_id="agent-1",
+        conversation_group=None,
+        cwd="/tmp/project",
+        session_id="ses_active",
+    )
+    client = FakeOpenCodeClient(statuses=[{"ses_active": {"type": "idle"}}])
+    runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
+
+    started = await runner.start_run(
+        conversation_id="task-conv",
+        prompt="scheduled ping",
+        request_body={
+            "agent_id": "agent-1",
+            "cwd": "/tmp/project",
+            "open_code_session_id": "ses_legacy",
+        },
+    )
+
+    assert started is True
+    assert client.created_sessions == []
+    assert client.prompts == [
+        {
+            "session_id": "ses_active",
+            "prompt": "scheduled ping",
+            "directory": "/tmp/project",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_clearing_active_session_strips_legacy_session_pins(tmp_path: Path) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    record = parse_task_payload(
+        {
+            "agent_id": "agent-1",
+            "conversation_id": "task-conv",
+            "cwd": "/tmp/project",
+            "prompt": "scheduled ping",
+            "open_code_session_id": "ses_legacy",
+            "enabled": True,
+            "time_zone": "UTC",
+            "schedule": {"frequency": "daily"},
+        }
+    )
+    await store.create_task(record)
+    await store.save_opencode_session(
+        agent_id="agent-1",
+        conversation_id="task-conv",
+        conversation_group=None,
+        cwd="/tmp/project",
+        session_id="ses_legacy",
+    )
+    await store.save_active_opencode_session(
+        agent_id="agent-1",
+        conversation_group=None,
+        cwd="/tmp/project",
+        session_id="ses_legacy",
+    )
+
+    await store.clear_active_opencode_session(
+        agent_id="agent-1",
+        conversation_group=None,
+        cwd="/tmp/project",
+    )
+
+    updated = await store.get_task(record.id)
+    assert updated is not None
+    assert "open_code_session_id" not in updated.request_body
+    assert (
+        await store.get_opencode_session(
+            agent_id="agent-1",
+            conversation_id="task-conv",
+            conversation_group=None,
+            cwd="/tmp/project",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_task_scheduler_runs_scheduled_task_through_opencode_runner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

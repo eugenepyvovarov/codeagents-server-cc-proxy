@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1270,6 +1271,114 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         return JSONResponse(
             status_code=200,
             content={"tasks": [serialize_task(task) for task in tasks]},
+            headers=proxy_headers(),
+        )
+
+    def _active_opencode_payload_values(payload: dict[str, Any]) -> tuple[str, str | None, str, str | None]:
+        agent_id = payload.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id.strip():
+            raise ValueError("agent_id is required.")
+        agent_id = sanitize_id(agent_id)
+
+        conversation_group = payload.get("conversation_group")
+        if isinstance(conversation_group, str) and conversation_group.strip():
+            group_value = sanitize_id(conversation_group)
+        else:
+            group_value = None
+
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise ValueError("cwd is required.")
+        cwd_value = cwd.strip()
+
+        session_id = payload.get("session_id") or payload.get("open_code_session_id")
+        session_value = session_id.strip() if isinstance(session_id, str) and session_id.strip() else None
+        return agent_id, group_value, cwd_value, session_value
+
+    @app.get("/v1/opencode/active-session")
+    async def get_active_opencode_session(
+        agent_id: str,
+        cwd: str,
+        conversation_group: str | None = None,
+    ) -> JSONResponse:
+        try:
+            agent_value = sanitize_id(agent_id)
+            group_value = sanitize_id(conversation_group) if conversation_group else None
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+        cwd_value = cwd.strip()
+        if not cwd_value:
+            return json_error(400, error="bad_request", message="cwd is required.")
+
+        session_id = await task_store.get_active_opencode_session(
+            agent_id=agent_value,
+            conversation_group=group_value,
+            cwd=cwd_value,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "agent_id": agent_value,
+                "conversation_group": group_value,
+                "cwd": cwd_value,
+                "session_id": session_id,
+            },
+            headers=proxy_headers(),
+        )
+
+    @app.post("/v1/opencode/active-session")
+    async def set_active_opencode_session(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            return json_error(400, error="bad_request", message="Invalid JSON payload.")
+        if not isinstance(payload, dict):
+            return json_error(400, error="bad_request", message="Payload must be an object.")
+
+        try:
+            agent_id, conversation_group, cwd, session_id = _active_opencode_payload_values(payload)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        if session_id:
+            await task_store.save_active_opencode_session(
+                agent_id=agent_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+                session_id=session_id,
+            )
+        else:
+            await task_store.clear_active_opencode_session(
+                agent_id=agent_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+            )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ok": True,
+                "agent_id": agent_id,
+                "conversation_group": conversation_group,
+                "cwd": cwd,
+                "session_id": session_id,
+            },
+            headers=proxy_headers(),
+        )
+
+    @app.get("/v1/push/status")
+    async def push_status() -> JSONResponse:
+        secret = os.environ.get("CODEAGENTS_PUSH_SECRET", "").strip()
+        gateway_url = os.environ.get("CODEAGENTS_PUSH_GATEWAY_BASE_URL", "").strip()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "configured": bool(secret and gateway_url),
+                "has_secret": bool(secret),
+                "server_key": hashlib.sha256(secret.encode("utf-8")).hexdigest() if secret else None,
+                "has_gateway_url": bool(gateway_url),
+                "gateway_url": gateway_url or None,
+            },
             headers=proxy_headers(),
         )
 

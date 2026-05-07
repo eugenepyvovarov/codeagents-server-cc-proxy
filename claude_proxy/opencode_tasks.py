@@ -95,9 +95,30 @@ class OpenCodeTaskRunner:
             else None
         )
 
+        active_session_id = await self._store.get_active_opencode_session(
+            agent_id=agent_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+        )
+        if active_session_id:
+            await self._store.save_opencode_session(
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+                session_id=active_session_id,
+            )
+            return active_session_id
+
         explicit_session_id = request_body.get("open_code_session_id") or request_body.get("session_id")
         if isinstance(explicit_session_id, str) and explicit_session_id.strip():
             session_id = explicit_session_id.strip()
+            await self._store.save_active_opencode_session(
+                agent_id=agent_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+                session_id=session_id,
+            )
             await self._store.save_opencode_session(
                 agent_id=agent_id,
                 conversation_id=conversation_id,
@@ -123,6 +144,12 @@ class OpenCodeTaskRunner:
             raise ValueError("OpenCode did not return a session id.")
 
         session_id = session_id.strip()
+        await self._store.save_active_opencode_session(
+            agent_id=agent_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+            session_id=session_id,
+        )
         await self._store.save_opencode_session(
             agent_id=agent_id,
             conversation_id=conversation_id,

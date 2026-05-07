@@ -501,6 +501,18 @@ class TaskStore:
                     updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_opencode_sessions_agent_id ON opencode_sessions(agent_id);
+
+                CREATE TABLE IF NOT EXISTS opencode_active_sessions (
+                    session_key TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    conversation_group TEXT,
+                    cwd TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_opencode_active_sessions_agent_id ON opencode_active_sessions(agent_id);
+                CREATE INDEX IF NOT EXISTS idx_opencode_active_sessions_cwd ON opencode_active_sessions(cwd);
                 """
             )
 
@@ -681,6 +693,163 @@ class TaskStore:
                 ),
             )
 
+    async def get_active_opencode_session(
+        self,
+        *,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> str | None:
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._get_active_opencode_session_sync,
+                agent_id,
+                conversation_group,
+                cwd,
+            )
+
+    def _get_active_opencode_session_sync(
+        self,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> str | None:
+        session_key = self._active_opencode_session_key(
+            agent_id=agent_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+        )
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM opencode_active_sessions WHERE session_key = ?",
+                (session_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["session_id"]
+
+    async def save_active_opencode_session(
+        self,
+        *,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+        session_id: str,
+    ) -> None:
+        async with self._lock:
+            await asyncio.to_thread(
+                self._save_active_opencode_session_sync,
+                agent_id,
+                conversation_group,
+                cwd,
+                session_id,
+            )
+
+    def _save_active_opencode_session_sync(
+        self,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+        session_id: str,
+    ) -> None:
+        session_key = self._active_opencode_session_key(
+            agent_id=agent_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+        )
+        now = _iso_utc(_now_utc())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO opencode_active_sessions (
+                    session_key,
+                    agent_id,
+                    conversation_group,
+                    cwd,
+                    session_id,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session_key,
+                    agent_id,
+                    conversation_group,
+                    cwd,
+                    session_id,
+                    now,
+                    now,
+                ),
+            )
+
+    async def clear_active_opencode_session(
+        self,
+        *,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> None:
+        async with self._lock:
+            await asyncio.to_thread(
+                self._clear_active_opencode_session_sync,
+                agent_id,
+                conversation_group,
+                cwd,
+            )
+
+    def _clear_active_opencode_session_sync(
+        self,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> None:
+        session_key = self._active_opencode_session_key(
+            agent_id=agent_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+        )
+        now = _iso_utc(_now_utc())
+        with self._connect() as conn:
+            conn.execute("DELETE FROM opencode_active_sessions WHERE session_key = ?", (session_key,))
+            rows = conn.execute(
+                """
+                SELECT id, request_body_json
+                FROM tasks
+                WHERE agent_id = ? AND cwd = ?
+                  AND ((? IS NULL AND conversation_group IS NULL) OR conversation_group = ?)
+                """,
+                (agent_id, cwd, conversation_group, conversation_group),
+            ).fetchall()
+            for row in rows:
+                try:
+                    request_body = json.loads(row["request_body_json"] or "{}")
+                except Exception:
+                    request_body = {}
+                if not isinstance(request_body, dict):
+                    request_body = {}
+                changed = False
+                for key in ("open_code_session_id", "session_id"):
+                    if key in request_body:
+                        request_body.pop(key, None)
+                        changed = True
+                if changed:
+                    conn.execute(
+                        "UPDATE tasks SET request_body_json = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(request_body, sort_keys=True), now, row["id"]),
+                    )
+            conn.execute(
+                """
+                DELETE FROM opencode_sessions
+                WHERE agent_id = ? AND cwd = ?
+                  AND ((? IS NULL AND conversation_group IS NULL) OR conversation_group = ?)
+                """,
+                (agent_id, cwd, conversation_group, conversation_group),
+            )
+
     def _opencode_session_key(
         self,
         *,
@@ -693,6 +862,24 @@ class TaskStore:
             {
                 "agent_id": agent_id,
                 "conversation_id": conversation_id,
+                "conversation_group": conversation_group or "",
+                "cwd": cwd,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def _active_opencode_session_key(
+        self,
+        *,
+        agent_id: str,
+        conversation_group: str | None,
+        cwd: str,
+    ) -> str:
+        identity = json.dumps(
+            {
+                "agent_id": agent_id,
                 "conversation_group": conversation_group or "",
                 "cwd": cwd,
             },

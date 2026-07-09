@@ -444,6 +444,35 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             payload["schedule"] = schedule_payload
         return payload
 
+    def _format_time_minutes(value: Any) -> str | None:
+        try:
+            minutes = int(value)
+        except (TypeError, ValueError):
+            return None
+        minutes = max(0, min(minutes, 1_439))
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+    def _task_summary_line(task: dict[str, Any]) -> str:
+        task_id = str(task.get("id", "")).strip()
+        title = str(task.get("title", "")).strip() or "(untitled)"
+        status = "enabled" if task.get("enabled") else "disabled"
+        time_zone = str(task.get("time_zone") or "UTC").strip() or "UTC"
+        schedule = task.get("schedule") if isinstance(task.get("schedule"), dict) else {}
+        frequency = str(schedule.get("frequency") or "").strip() or "unknown"
+        clock = _format_time_minutes(schedule.get("time_minutes"))
+        next_run = str(task.get("next_run_at") or "").strip() or "n/a"
+        last_run = str(task.get("last_run_at") or "").strip() or "never"
+        last_error = str(task.get("last_error") or "").strip()
+
+        parts = [f"{title} [{task_id}] ({status})", f"freq={frequency}", f"tz={time_zone}"]
+        if clock is not None:
+            parts.append(f"at={clock}")
+        parts.append(f"next={next_run}")
+        parts.append(f"last={last_run}")
+        if last_error:
+            parts.append(f"error={last_error}")
+        return " ".join(parts)
+
     def _task_tools_schema() -> list[dict[str, Any]]:
         return [
             {
@@ -459,7 +488,13 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             },
             {
                 "name": MCP_TOOL_NAME_CREATE,
-                "description": "Create a scheduled task for the active project.",
+                "description": (
+                    "Create a scheduled task for the active project. "
+                    "time_minutes is wall-clock minutes from midnight in time_zone "
+                    "(e.g. 540 = 09:00). Always pass time_zone as an IANA id "
+                    "(e.g. Europe/Berlin) matching the user's local timezone unless they specify otherwise. "
+                    "After create, confirm next_run_at and time_zone in the tool result."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -467,8 +502,18 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                         "prompt": {"type": "string", "description": "Direct prompt to schedule."},
                         "message": {"type": "string", "description": "Prompt text if direct prompt is not provided."},
                         "isEnabled": {"type": "boolean"},
-                        "timeZoneId": {"type": "string"},
-                        "time_zone": {"type": "string"},
+                        "timeZoneId": {
+                            "type": "string",
+                            "description": "IANA timezone (alias of time_zone), e.g. Europe/Berlin.",
+                        },
+                        "time_zone": {
+                            "type": "string",
+                            "description": (
+                                "IANA timezone for time_minutes (e.g. Europe/Berlin). "
+                                "Required unless the client sends x-codeagents-time-zone. "
+                                "Do not omit this when the user gives a local clock time."
+                            ),
+                        },
                         "frequency": {"type": "string"},
                         "interval": {"type": "integer"},
                         "weekday_mask": {"type": "integer"},
@@ -477,7 +522,10 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                         "weekday_ordinal": {"type": "string"},
                         "weekday": {"type": "integer"},
                         "month": {"type": "integer"},
-                        "time_minutes": {"type": "integer"},
+                        "time_minutes": {
+                            "type": "integer",
+                            "description": "Minutes from midnight in time_zone (0-1439). Example: 540 = 09:00.",
+                        },
                         "skill_slug": {"type": "string"},
                         "skill_name": {"type": "string"},
                         "file_references": {"type": "array", "items": {"type": "string"}},
@@ -487,7 +535,11 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             },
             {
                 "name": MCP_TOOL_NAME_UPDATE,
-                "description": "Update an existing scheduled task for the active project.",
+                "description": (
+                    "Update an existing scheduled task for the active project. "
+                    "When changing the clock time, also pass time_zone (IANA) so the schedule stays in the user's local zone. "
+                    "Confirm next_run_at after update."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "required": ["task_id"],
@@ -497,8 +549,14 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                         "prompt": {"type": "string"},
                         "message": {"type": "string"},
                         "isEnabled": {"type": "boolean"},
-                        "timeZoneId": {"type": "string"},
-                        "time_zone": {"type": "string"},
+                        "timeZoneId": {
+                            "type": "string",
+                            "description": "IANA timezone (alias of time_zone), e.g. Europe/Berlin.",
+                        },
+                        "time_zone": {
+                            "type": "string",
+                            "description": "IANA timezone for schedule wall-clock times (e.g. Europe/Berlin).",
+                        },
                         "frequency": {"type": "string"},
                         "interval": {"type": "integer"},
                         "weekday_mask": {"type": "integer"},
@@ -507,7 +565,10 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                         "weekday_ordinal": {"type": "string"},
                         "weekday": {"type": "integer"},
                         "month": {"type": "integer"},
-                        "time_minutes": {"type": "integer"},
+                        "time_minutes": {
+                            "type": "integer",
+                            "description": "Minutes from midnight in time_zone (0-1439). Example: 540 = 09:00.",
+                        },
                         "skill_slug": {"type": "string"},
                         "skill_name": {"type": "string"},
                         "file_references": {"type": "array", "items": {"type": "string"}},
@@ -693,10 +754,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             if serialized:
                 lines = [f"Found {len(serialized)} scheduled task(s):"]
                 for task in serialized:
-                    task_id = str(task.get("id", "")).strip()
-                    title = str(task.get("title", "")).strip() or "(untitled)"
-                    status = "enabled" if task.get("enabled") else "disabled"
-                    lines.append(f"- {title} [{task_id}] ({status})")
+                    lines.append(f"- {_task_summary_line(task)}")
                 text = "\n".join(lines)
             else:
                 text = "No scheduled tasks found."
@@ -724,6 +782,21 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             )
 
         if tool_name == MCP_TOOL_NAME_CREATE:
+            if not scoped_payload.get("time_zone"):
+                return JSONResponse(
+                    status_code=200,
+                    content=_mcp_error(
+                        payload_id,
+                        -32602,
+                        (
+                            "time_zone is required when creating a scheduled task. "
+                            "Pass an IANA timezone such as Europe/Berlin that matches the user's local clock "
+                            "(or ensure the client sends x-codeagents-time-zone). "
+                            "Without it, wall-clock times like 09:00 would be mis-scheduled."
+                        ),
+                    ),
+                    headers=proxy_headers(),
+                )
             try:
                 record = parse_task_payload(scoped_payload)
             except (TaskValidationError, ValueError) as exc:
@@ -734,12 +807,19 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 )
 
             stored = await task_scheduler.create_task(record)
+            stored_payload = serialize_task(stored)
             return JSONResponse(
                 status_code=200,
                 content=_mcp_result(
                     payload_id,
                     {
-                        "task": serialize_task(stored),
+                        "task": stored_payload,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Created scheduled task: {_task_summary_line(stored_payload)}",
+                            }
+                        ],
                     },
                 ),
                 headers=proxy_headers(),
@@ -781,12 +861,19 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 )
 
             stored = await task_scheduler.update_task(task_id, updated)
+            stored_payload = serialize_task(stored)
             return JSONResponse(
                 status_code=200,
                 content=_mcp_result(
                     payload_id,
                     {
-                        "task": serialize_task(stored),
+                        "task": stored_payload,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Updated scheduled task: {_task_summary_line(stored_payload)}",
+                            }
+                        ],
                     },
                 ),
                 headers=proxy_headers(),

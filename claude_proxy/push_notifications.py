@@ -39,6 +39,11 @@ def _normalize_preview(text: str, max_len: int = 600) -> str | None:
     return collapsed[:slice_len].rstrip() + "…"
 
 
+# Cloud Functions cold-start + FCM multicast routinely exceeds 2–3s.
+# Keep this high enough that scheduled-task completions are not dropped.
+_PUSH_GATEWAY_TIMEOUT_SECONDS = 15.0
+
+
 def _post_json(url: str, *, secret: str, payload: dict[str, Any]) -> dict[str, Any]:
     data = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -50,7 +55,7 @@ def _post_json(url: str, *, secret: str, payload: dict[str, Any]) -> dict[str, A
             "Authorization": f"Bearer {secret}",
         },
     )
-    with urllib.request.urlopen(request, timeout=2.5) as response:
+    with urllib.request.urlopen(request, timeout=_PUSH_GATEWAY_TIMEOUT_SECONDS) as response:
         raw = response.read()
     if not raw:
         return {}
@@ -97,10 +102,22 @@ async def trigger_reply_finished(
         result = await asyncio.to_thread(_post_json, url, secret=secret, payload=payload)
         attempted = result.get("attempted")
         sent = result.get("sent")
+        pruned = result.get("pruned")
+        errors = result.get("errors")
         if attempted == 0:
             logger.info("Push trigger completed with no registered devices for cwd=%s", cwd)
         elif isinstance(attempted, int) and isinstance(sent, int) and sent <= 0:
-            logger.warning("Push trigger sent 0/%s notifications for cwd=%s", attempted, cwd)
+            extra = ""
+            if isinstance(errors, dict) and errors:
+                extra = f" errors={errors}"
+            if isinstance(pruned, int) and pruned > 0:
+                extra += f" pruned={pruned}"
+            logger.warning(
+                "Push trigger sent 0/%s notifications for cwd=%s%s",
+                attempted,
+                cwd,
+                extra,
+            )
         elif isinstance(attempted, int) and isinstance(sent, int):
             logger.info("Push trigger sent %s/%s notifications for cwd=%s", sent, attempted, cwd)
     except urllib.error.HTTPError as exc:

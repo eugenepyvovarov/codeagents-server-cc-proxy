@@ -12,10 +12,18 @@ from claude_proxy.task_scheduler import TaskScheduler, TaskStore, parse_task_pay
 
 
 class FakeOpenCodeClient:
-    def __init__(self, *, statuses: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        statuses: list[dict[str, Any]] | None = None,
+        prompt_errors: list[Exception] | None = None,
+        created_session_id: str = "ses_fixture00001",
+    ) -> None:
         self.created_sessions: list[dict[str, Any]] = []
         self.prompts: list[dict[str, Any]] = []
-        self.statuses = statuses or [{"ses_fixture": {"type": "idle"}}]
+        self.created_session_id = created_session_id
+        self.statuses = statuses or [{created_session_id: {"type": "idle"}}]
+        self.prompt_errors = list(prompt_errors or [])
 
     async def create_session(
         self,
@@ -31,7 +39,7 @@ class FakeOpenCodeClient:
                 "directory": directory,
             }
         )
-        return {"id": "ses_fixture"}
+        return {"id": self.created_session_id}
 
     async def session_status(self, *, directory: str | None = None) -> dict[str, Any]:
         _ = directory
@@ -40,6 +48,8 @@ class FakeOpenCodeClient:
         return self.statuses[0]
 
     async def prompt_async(self, *, session_id: str, prompt: str, directory: str | None = None) -> None:
+        if self.prompt_errors:
+            raise self.prompt_errors.pop(0)
         self.prompts.append(
             {
                 "session_id": session_id,
@@ -102,7 +112,7 @@ async def test_opencode_task_runner_creates_session_runs_prompt_and_triggers_pus
     ]
     assert client.prompts == [
         {
-            "session_id": "ses_fixture",
+            "session_id": "ses_fixture00001",
             "prompt": "scheduled ping",
             "directory": "/tmp/project",
         }
@@ -114,12 +124,12 @@ async def test_opencode_task_runner_creates_session_runs_prompt_and_triggers_pus
             conversation_group="main",
             cwd="/tmp/project",
         )
-        == "ses_fixture"
+        == "ses_fixture00001"
     )
     assert pushed == [
         {
             "cwd": "/tmp/project",
-            "conversation_id": "ses_fixture",
+            "conversation_id": "ses_fixture00001",
             "message_preview": "scheduled task complete",
             "renderable_assistant_count": 1,
         }
@@ -129,16 +139,16 @@ async def test_opencode_task_runner_creates_session_runs_prompt_and_triggers_pus
 @pytest.mark.asyncio
 async def test_opencode_task_runner_defers_when_session_is_busy(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "tasks.db")
-    client = FakeOpenCodeClient(statuses=[{"ses_existing": {"type": "busy"}}])
+    client = FakeOpenCodeClient(statuses=[{"ses_existing0001": {"type": "busy"}}])
     runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
 
     started = await runner.start_run(
-        conversation_id="ses_existing",
+        conversation_id="ses_existing0001",
         prompt="scheduled ping",
         request_body={
             "agent_id": "agent-1",
             "cwd": "/tmp/project",
-            "session_id": "ses_existing",
+            "session_id": "ses_existing0001",
         },
     )
 
@@ -154,9 +164,9 @@ async def test_opencode_task_runner_prefers_active_session_over_legacy_explicit_
         agent_id="agent-1",
         conversation_group=None,
         cwd="/tmp/project",
-        session_id="ses_active",
+        session_id="ses_active000001",
     )
-    client = FakeOpenCodeClient(statuses=[{"ses_active": {"type": "idle"}}])
+    client = FakeOpenCodeClient(statuses=[{"ses_active000001": {"type": "idle"}}])
     runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
 
     started = await runner.start_run(
@@ -165,7 +175,7 @@ async def test_opencode_task_runner_prefers_active_session_over_legacy_explicit_
         request_body={
             "agent_id": "agent-1",
             "cwd": "/tmp/project",
-            "open_code_session_id": "ses_legacy",
+            "open_code_session_id": "ses_legacy000001",
         },
     )
 
@@ -173,7 +183,7 @@ async def test_opencode_task_runner_prefers_active_session_over_legacy_explicit_
     assert client.created_sessions == []
     assert client.prompts == [
         {
-            "session_id": "ses_active",
+            "session_id": "ses_active000001",
             "prompt": "scheduled ping",
             "directory": "/tmp/project",
         }
@@ -212,7 +222,7 @@ async def test_opencode_task_runner_matches_active_session_despite_agent_id_case
                 session_key,
                 "A027C2D3-79AA-416D-8349-7DDFEE4E9A46",
                 "/home/codeagent/projects/X",
-                "ses_real_chat",
+                "ses_realchat00001",
                 "2026-07-09T07:00:00Z",
                 "2026-07-09T07:18:00Z",
             ),
@@ -238,13 +248,13 @@ async def test_opencode_task_runner_matches_active_session_despite_agent_id_case
                 session_key_lower,
                 "a027c2d3-79aa-416d-8349-7ddfee4e9a46",
                 "/home/codeagent/projects/X",
-                "ses_side_scheduled",
+                "ses_sidesched0001",
                 "2026-07-09T07:30:00Z",
                 "2026-07-09T07:30:00Z",
             ),
         )
 
-    client = FakeOpenCodeClient(statuses=[{"ses_real_chat": {"type": "idle"}}])
+    client = FakeOpenCodeClient(statuses=[{"ses_realchat00001": {"type": "idle"}}])
     runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
 
     started = await runner.start_run(
@@ -260,7 +270,7 @@ async def test_opencode_task_runner_matches_active_session_despite_agent_id_case
     assert client.created_sessions == []
     assert client.prompts == [
         {
-            "session_id": "ses_real_chat",
+            "session_id": "ses_realchat00001",
             "prompt": "Ask me how I am doing today.",
             "directory": "/home/codeagent/projects/X",
         }
@@ -297,7 +307,108 @@ async def test_opencode_task_runner_does_not_pin_created_side_session_as_active(
             conversation_group=None,
             cwd="/tmp/project",
         )
-        == "ses_fixture"
+        == "ses_fixture00001"
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_task_runner_skips_invalid_active_pin_and_creates_session(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    await store.save_active_opencode_session(
+        agent_id="agent-1",
+        conversation_group=None,
+        cwd="/tmp/project",
+        session_id="ses_diag",
+    )
+    client = FakeOpenCodeClient(created_session_id="ses_healed0000001")
+    runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
+
+    started = await runner.start_run(
+        conversation_id="task-conv",
+        prompt="scheduled ping",
+        request_body={
+            "agent_id": "agent-1",
+            "cwd": "/tmp/project",
+        },
+    )
+
+    assert started is True
+    assert client.created_sessions
+    assert client.prompts == [
+        {
+            "session_id": "ses_healed0000001",
+            "prompt": "scheduled ping",
+            "directory": "/tmp/project",
+        }
+    ]
+    assert (
+        await store.get_active_opencode_session(
+            agent_id="agent-1",
+            conversation_group=None,
+            cwd="/tmp/project",
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_opencode_task_runner_recovers_from_missing_session_404(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import httpx
+
+    async def fake_push(**payload: Any) -> None:
+        _ = payload
+
+    monkeypatch.setattr(opencode_tasks, "trigger_reply_finished", fake_push)
+
+    store = TaskStore(tmp_path / "tasks.db")
+    await store.save_active_opencode_session(
+        agent_id="agent-1",
+        conversation_group=None,
+        cwd="/tmp/project",
+        session_id="ses_dead00000001",
+    )
+    request = httpx.Request("POST", "http://127.0.0.1:4096/session/ses_dead00000001/prompt_async")
+    response = httpx.Response(404, request=request)
+    client = FakeOpenCodeClient(
+        statuses=[
+            {"ses_dead00000001": {"type": "idle"}},
+            {"ses_healed0000001": {"type": "idle"}},
+        ],
+        prompt_errors=[httpx.HTTPStatusError("missing", request=request, response=response)],
+        created_session_id="ses_healed0000001",
+    )
+    runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
+
+    started = await runner.start_run(
+        conversation_id="task-conv",
+        prompt="scheduled ping",
+        request_body={
+            "agent_id": "agent-1",
+            "cwd": "/tmp/project",
+        },
+    )
+
+    assert started is True
+    assert client.created_sessions
+    assert client.prompts == [
+        {
+            "session_id": "ses_healed0000001",
+            "prompt": "scheduled ping",
+            "directory": "/tmp/project",
+        }
+    ]
+    assert (
+        await store.get_active_opencode_session(
+            agent_id="agent-1",
+            conversation_group=None,
+            cwd="/tmp/project",
+        )
+        == "ses_healed0000001"
     )
 
 
@@ -310,7 +421,7 @@ async def test_clearing_active_session_strips_legacy_session_pins(tmp_path: Path
             "conversation_id": "task-conv",
             "cwd": "/tmp/project",
             "prompt": "scheduled ping",
-            "open_code_session_id": "ses_legacy",
+            "open_code_session_id": "ses_legacy000001",
             "enabled": True,
             "time_zone": "UTC",
             "schedule": {"frequency": "daily"},
@@ -322,13 +433,13 @@ async def test_clearing_active_session_strips_legacy_session_pins(tmp_path: Path
         conversation_id="task-conv",
         conversation_group=None,
         cwd="/tmp/project",
-        session_id="ses_legacy",
+        session_id="ses_legacy000001",
     )
     await store.save_active_opencode_session(
         agent_id="agent-1",
         conversation_group=None,
         cwd="/tmp/project",
-        session_id="ses_legacy",
+        session_id="ses_legacy000001",
     )
 
     await store.clear_active_opencode_session(
@@ -388,7 +499,7 @@ async def test_task_scheduler_runs_scheduled_task_through_opencode_runner(
         assert updated.last_run_at is not None
         assert client.prompts == [
             {
-                "session_id": "ses_fixture",
+                "session_id": "ses_fixture00001",
                 "prompt": "scheduled ping",
                 "directory": "/tmp/project",
             }
@@ -401,7 +512,7 @@ def test_parse_task_payload_uses_opencode_session_id_when_conversation_id_is_abs
     record = parse_task_payload(
         {
             "agent_id": "agent-1",
-            "open_code_session_id": "ses_fixture",
+            "open_code_session_id": "ses_fixture00001",
             "cwd": "/tmp/project",
             "prompt": "scheduled ping",
             "enabled": True,
@@ -410,8 +521,8 @@ def test_parse_task_payload_uses_opencode_session_id_when_conversation_id_is_abs
         }
     )
 
-    assert record.conversation_id == "ses_fixture"
-    assert record.request_body["open_code_session_id"] == "ses_fixture"
+    assert record.conversation_id == "ses_fixture00001"
+    assert record.request_body["open_code_session_id"] == "ses_fixture00001"
 
 
 def test_summarize_open_code_messages_counts_renderable_assistant_parts() -> None:

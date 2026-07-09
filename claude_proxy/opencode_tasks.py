@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
+
+import httpx
 
 from claude_proxy.conversation_manager import AgentFolderBusyError
 from claude_proxy.opencode_client import OpenCodeClient
@@ -10,6 +13,9 @@ from claude_proxy.push_notifications import trigger_reply_finished
 from claude_proxy.util import normalize_agent_id
 
 logger = logging.getLogger(__name__)
+
+# Real OpenCode ids look like ses_<long token>. Reject placeholders (e.g. ses_diag).
+_OPENCODE_SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]{12,}$")
 
 
 class OpenCodeTaskRunner:
@@ -66,7 +72,24 @@ class OpenCodeTaskRunner:
             if await self._is_session_busy(session_id=session_id, cwd=cwd):
                 return False
 
-            await self._client.prompt_async(session_id=session_id, prompt=prompt, directory=cwd)
+            try:
+                await self._client.prompt_async(session_id=session_id, prompt=prompt, directory=cwd)
+            except httpx.HTTPStatusError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                logger.warning(
+                    "OpenCode session %s missing (404); clearing pin and recreating for cwd=%s",
+                    session_id,
+                    cwd,
+                )
+                session_id = await self._recreate_session_after_missing(
+                    conversation_id=conversation_id,
+                    cwd=cwd,
+                    request_body=request_body,
+                    dead_session_id=session_id,
+                )
+                await self._client.prompt_async(session_id=session_id, prompt=prompt, directory=cwd)
+
             await self._wait_until_idle(session_id=session_id, cwd=cwd)
             await self._trigger_push_if_configured(session_id=session_id, cwd=cwd)
             return True
@@ -86,27 +109,27 @@ class OpenCodeTaskRunner:
         cwd: str,
         request_body: dict[str, Any],
     ) -> str:
-        raw_agent_id = request_body.get("agent_id")
-        if isinstance(raw_agent_id, str) and raw_agent_id.strip():
-            try:
-                agent_id = normalize_agent_id(raw_agent_id)
-            except ValueError:
-                agent_id = raw_agent_id.strip().lower()
-        else:
-            agent_id = "default"
-
-        conversation_group = request_body.get("conversation_group")
-        conversation_group = (
-            conversation_group.strip()
-            if isinstance(conversation_group, str) and conversation_group.strip()
-            else None
-        )
+        agent_id, conversation_group = self._identity_from_request(request_body)
 
         active_session_id = await self._store.get_active_opencode_session(
             agent_id=agent_id,
             conversation_group=conversation_group,
             cwd=cwd,
         )
+        if active_session_id and not looks_like_opencode_session_id(active_session_id):
+            logger.warning(
+                "Ignoring invalid active OpenCode pin %r for agent=%s cwd=%s",
+                active_session_id,
+                agent_id,
+                cwd,
+            )
+            await self._store.clear_active_opencode_session(
+                agent_id=agent_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+            )
+            active_session_id = None
+
         if active_session_id:
             await self._store.save_opencode_session(
                 agent_id=agent_id,
@@ -127,20 +150,27 @@ class OpenCodeTaskRunner:
         explicit_session_id = request_body.get("open_code_session_id") or request_body.get("session_id")
         if isinstance(explicit_session_id, str) and explicit_session_id.strip():
             session_id = explicit_session_id.strip()
-            await self._store.save_active_opencode_session(
-                agent_id=agent_id,
-                conversation_group=conversation_group,
-                cwd=cwd,
-                session_id=session_id,
+            if looks_like_opencode_session_id(session_id):
+                await self._store.save_active_opencode_session(
+                    agent_id=agent_id,
+                    conversation_group=conversation_group,
+                    cwd=cwd,
+                    session_id=session_id,
+                )
+                await self._store.save_opencode_session(
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    conversation_group=conversation_group,
+                    cwd=cwd,
+                    session_id=session_id,
+                )
+                return session_id
+            logger.warning(
+                "Ignoring invalid explicit OpenCode session id %r for agent=%s cwd=%s",
+                session_id,
+                agent_id,
+                cwd,
             )
-            await self._store.save_opencode_session(
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-                conversation_group=conversation_group,
-                cwd=cwd,
-                session_id=session_id,
-            )
-            return session_id
 
         stored_session_id = await self._store.get_opencode_session(
             agent_id=agent_id,
@@ -148,9 +178,57 @@ class OpenCodeTaskRunner:
             conversation_group=conversation_group,
             cwd=cwd,
         )
-        if stored_session_id:
+        if stored_session_id and looks_like_opencode_session_id(stored_session_id):
             return stored_session_id
 
+        return await self._create_and_store_session(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+            pin_as_active=False,
+        )
+
+    async def _recreate_session_after_missing(
+        self,
+        *,
+        conversation_id: str,
+        cwd: str,
+        request_body: dict[str, Any],
+        dead_session_id: str,
+    ) -> str:
+        agent_id, conversation_group = self._identity_from_request(request_body)
+        try:
+            await self._store.clear_active_opencode_session(
+                agent_id=agent_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+            )
+        except Exception:
+            logger.exception(
+                "Failed clearing dead OpenCode pin %s for agent=%s cwd=%s",
+                dead_session_id,
+                agent_id,
+                cwd,
+            )
+        # Create a replacement and pin it so chat + scheduler reconverge on a live session.
+        return await self._create_and_store_session(
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            conversation_group=conversation_group,
+            cwd=cwd,
+            pin_as_active=True,
+        )
+
+    async def _create_and_store_session(
+        self,
+        *,
+        agent_id: str,
+        conversation_id: str,
+        conversation_group: str | None,
+        cwd: str,
+        pin_as_active: bool,
+    ) -> str:
         title = self._session_title(agent_id=agent_id, cwd=cwd, conversation_group=conversation_group)
         created = await self._client.create_session(title=title, directory=cwd)
         session_id = created.get("id")
@@ -158,7 +236,6 @@ class OpenCodeTaskRunner:
             raise ValueError("OpenCode did not return a session id.")
 
         session_id = session_id.strip()
-        # Do not overwrite the app's active chat pin with a scheduler-created side session.
         await self._store.save_opencode_session(
             agent_id=agent_id,
             conversation_id=conversation_id,
@@ -166,7 +243,32 @@ class OpenCodeTaskRunner:
             cwd=cwd,
             session_id=session_id,
         )
+        if pin_as_active:
+            await self._store.save_active_opencode_session(
+                agent_id=agent_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+                session_id=session_id,
+            )
         return session_id
+
+    def _identity_from_request(self, request_body: dict[str, Any]) -> tuple[str, str | None]:
+        raw_agent_id = request_body.get("agent_id")
+        if isinstance(raw_agent_id, str) and raw_agent_id.strip():
+            try:
+                agent_id = normalize_agent_id(raw_agent_id)
+            except ValueError:
+                agent_id = raw_agent_id.strip().lower()
+        else:
+            agent_id = "default"
+
+        conversation_group = request_body.get("conversation_group")
+        conversation_group = (
+            conversation_group.strip()
+            if isinstance(conversation_group, str) and conversation_group.strip()
+            else None
+        )
+        return agent_id, conversation_group
 
     async def _is_session_busy(self, *, session_id: str, cwd: str) -> bool:
         statuses = await self._client.session_status(directory=cwd)
@@ -204,6 +306,13 @@ class OpenCodeTaskRunner:
         if conversation_group:
             return f"Scheduled task: {project_name} ({conversation_group})"
         return f"Scheduled task: {project_name} ({agent_id})"
+
+
+def looks_like_opencode_session_id(value: str | None) -> bool:
+    if not isinstance(value, str):
+        return False
+    trimmed = value.strip()
+    return bool(_OPENCODE_SESSION_ID_RE.fullmatch(trimmed))
 
 
 def _status_type(value: Any) -> str | None:

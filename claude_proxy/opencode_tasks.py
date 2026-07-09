@@ -7,6 +7,7 @@ from typing import Any
 from claude_proxy.conversation_manager import AgentFolderBusyError
 from claude_proxy.opencode_client import OpenCodeClient
 from claude_proxy.push_notifications import trigger_reply_finished
+from claude_proxy.util import normalize_agent_id
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,14 @@ class OpenCodeTaskRunner:
         cwd: str,
         request_body: dict[str, Any],
     ) -> str:
-        agent_id = request_body.get("agent_id")
-        agent_id = agent_id.strip() if isinstance(agent_id, str) and agent_id.strip() else "default"
+        raw_agent_id = request_body.get("agent_id")
+        if isinstance(raw_agent_id, str) and raw_agent_id.strip():
+            try:
+                agent_id = normalize_agent_id(raw_agent_id)
+            except ValueError:
+                agent_id = raw_agent_id.strip().lower()
+        else:
+            agent_id = "default"
 
         conversation_group = request_body.get("conversation_group")
         conversation_group = (
@@ -104,6 +111,13 @@ class OpenCodeTaskRunner:
             await self._store.save_opencode_session(
                 agent_id=agent_id,
                 conversation_id=conversation_id,
+                conversation_group=conversation_group,
+                cwd=cwd,
+                session_id=active_session_id,
+            )
+            # Re-pin canonical lowercase key so mixed-case legacy rows collapse.
+            await self._store.save_active_opencode_session(
+                agent_id=agent_id,
                 conversation_group=conversation_group,
                 cwd=cwd,
                 session_id=active_session_id,
@@ -144,12 +158,7 @@ class OpenCodeTaskRunner:
             raise ValueError("OpenCode did not return a session id.")
 
         session_id = session_id.strip()
-        await self._store.save_active_opencode_session(
-            agent_id=agent_id,
-            conversation_group=conversation_group,
-            cwd=cwd,
-            session_id=session_id,
-        )
+        # Do not overwrite the app's active chat pin with a scheduler-created side session.
         await self._store.save_opencode_session(
             agent_id=agent_id,
             conversation_id=conversation_id,

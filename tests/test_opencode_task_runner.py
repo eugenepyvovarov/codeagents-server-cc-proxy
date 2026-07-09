@@ -181,6 +181,127 @@ async def test_opencode_task_runner_prefers_active_session_over_legacy_explicit_
 
 
 @pytest.mark.asyncio
+async def test_opencode_task_runner_matches_active_session_despite_agent_id_case(
+    tmp_path: Path,
+) -> None:
+    """iOS may pin active chat with uppercase UUID while tasks store lowercase."""
+    store = TaskStore(tmp_path / "tasks.db")
+    # Simulate legacy mixed-case pin written before normalize_agent_id.
+    import hashlib
+    import json
+    import sqlite3
+
+    identity = json.dumps(
+        {
+            "agent_id": "A027C2D3-79AA-416D-8349-7DDFEE4E9A46",
+            "conversation_group": "",
+            "cwd": "/home/codeagent/projects/X",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    session_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    with sqlite3.connect(tmp_path / "tasks.db") as conn:
+        conn.execute(
+            """
+            INSERT INTO opencode_active_sessions (
+                session_key, agent_id, conversation_group, cwd, session_id, created_at, updated_at
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                session_key,
+                "A027C2D3-79AA-416D-8349-7DDFEE4E9A46",
+                "/home/codeagent/projects/X",
+                "ses_real_chat",
+                "2026-07-09T07:00:00Z",
+                "2026-07-09T07:18:00Z",
+            ),
+        )
+        # Newer side-session pin under lowercase must not win over older real chat.
+        identity_lower = json.dumps(
+            {
+                "agent_id": "a027c2d3-79aa-416d-8349-7ddfee4e9a46",
+                "conversation_group": "",
+                "cwd": "/home/codeagent/projects/X",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        session_key_lower = hashlib.sha256(identity_lower.encode("utf-8")).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO opencode_active_sessions (
+                session_key, agent_id, conversation_group, cwd, session_id, created_at, updated_at
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                session_key_lower,
+                "a027c2d3-79aa-416d-8349-7ddfee4e9a46",
+                "/home/codeagent/projects/X",
+                "ses_side_scheduled",
+                "2026-07-09T07:30:00Z",
+                "2026-07-09T07:30:00Z",
+            ),
+        )
+
+    client = FakeOpenCodeClient(statuses=[{"ses_real_chat": {"type": "idle"}}])
+    runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
+
+    started = await runner.start_run(
+        conversation_id="scheduler-a027c2d3-79aa-416d-8349-7ddfee4e9a46",
+        prompt="Ask me how I am doing today.",
+        request_body={
+            "agent_id": "a027c2d3-79aa-416d-8349-7ddfee4e9a46",
+            "cwd": "/home/codeagent/projects/X",
+        },
+    )
+
+    assert started is True
+    assert client.created_sessions == []
+    assert client.prompts == [
+        {
+            "session_id": "ses_real_chat",
+            "prompt": "Ask me how I am doing today.",
+            "directory": "/home/codeagent/projects/X",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_opencode_task_runner_does_not_pin_created_side_session_as_active(
+    tmp_path: Path,
+) -> None:
+    store = TaskStore(tmp_path / "tasks.db")
+    client = FakeOpenCodeClient()
+    runner = OpenCodeTaskRunner(client=client, store=store, poll_interval_seconds=0)
+
+    started = await runner.start_run(
+        conversation_id="scheduler-conv",
+        prompt="scheduled ping",
+        request_body={
+            "agent_id": "agent-1",
+            "cwd": "/tmp/project",
+        },
+    )
+
+    assert started is True
+    assert await store.get_active_opencode_session(
+        agent_id="agent-1",
+        conversation_group=None,
+        cwd="/tmp/project",
+    ) is None
+    assert (
+        await store.get_opencode_session(
+            agent_id="agent-1",
+            conversation_id="scheduler-conv",
+            conversation_group=None,
+            cwd="/tmp/project",
+        )
+        == "ses_fixture"
+    )
+
+
+@pytest.mark.asyncio
 async def test_clearing_active_session_strips_legacy_session_pins(tmp_path: Path) -> None:
     store = TaskStore(tmp_path / "tasks.db")
     record = parse_task_payload(

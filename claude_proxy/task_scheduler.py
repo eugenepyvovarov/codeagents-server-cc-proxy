@@ -17,7 +17,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from claude_proxy.conversation_manager import AgentFolderBusyError, ConversationManager
-from claude_proxy.util import sanitize_id
+from claude_proxy.util import normalize_agent_id, sanitize_id
 
 logger = logging.getLogger(__name__)
 _MISSING = object()
@@ -260,7 +260,7 @@ def parse_task_payload(payload: dict[str, Any]) -> TaskRecord:
     agent_id = _sanitize_string(payload.get("agent_id"), "agent_id")
     if not agent_id:
         raise TaskValidationError("agent_id is required")
-    agent_id = sanitize_id(agent_id)
+    agent_id = normalize_agent_id(agent_id)
 
     conversation_id = _sanitize_string(
         payload.get("conversation_id") or payload.get("session_id") or payload.get("open_code_session_id"),
@@ -656,6 +656,10 @@ class TaskStore:
         cwd: str,
         session_id: str,
     ) -> None:
+        try:
+            agent_id = normalize_agent_id(agent_id) if agent_id else "default"
+        except ValueError:
+            agent_id = (agent_id or "default").strip().lower() or "default"
         session_key = self._opencode_session_key(
             agent_id=agent_id,
             conversation_id=conversation_id,
@@ -678,6 +682,7 @@ class TaskStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_key) DO UPDATE SET
+                    agent_id = excluded.agent_id,
                     session_id = excluded.session_id,
                     updated_at = excluded.updated_at
                 """,
@@ -714,19 +719,30 @@ class TaskStore:
         conversation_group: str | None,
         cwd: str,
     ) -> str | None:
-        session_key = self._active_opencode_session_key(
-            agent_id=agent_id,
-            conversation_group=conversation_group,
-            cwd=cwd,
-        )
+        agent_id = normalize_agent_id(agent_id) if agent_id else agent_id
+        # Prefer the oldest case-insensitive pin for this agent/cwd/group. A later
+        # scheduler-created side session under a different UUID case must not win
+        # over the app's real chat pin.
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT session_id FROM opencode_active_sessions WHERE session_key = ?",
-                (session_key,),
-            ).fetchone()
-        if row is None:
-            return None
-        return row["session_id"]
+            rows = conn.execute(
+                """
+                SELECT session_id, agent_id, conversation_group, created_at, updated_at
+                FROM opencode_active_sessions
+                WHERE cwd = ?
+                ORDER BY created_at ASC, updated_at ASC
+                """,
+                (cwd,),
+            ).fetchall()
+
+        target_group = conversation_group or ""
+        for candidate in rows:
+            if str(candidate["agent_id"] or "").lower() != agent_id:
+                continue
+            candidate_group = candidate["conversation_group"] or ""
+            if candidate_group != target_group:
+                continue
+            return candidate["session_id"]
+        return None
 
     async def save_active_opencode_session(
         self,
@@ -752,6 +768,7 @@ class TaskStore:
         cwd: str,
         session_id: str,
     ) -> None:
+        agent_id = normalize_agent_id(agent_id)
         session_key = self._active_opencode_session_key(
             agent_id=agent_id,
             conversation_group=conversation_group,
@@ -759,6 +776,29 @@ class TaskStore:
         )
         now = _iso_utc(_now_utc())
         with self._connect() as conn:
+            # Drop legacy mixed-case pins for the same agent/cwd/group so lookups
+            # and future saves share a single canonical key.
+            legacy_rows = conn.execute(
+                """
+                SELECT session_key, agent_id, conversation_group
+                FROM opencode_active_sessions
+                WHERE cwd = ?
+                """,
+                (cwd,),
+            ).fetchall()
+            target_group = conversation_group or ""
+            for legacy in legacy_rows:
+                if str(legacy["agent_id"] or "").lower() != agent_id:
+                    continue
+                if (legacy["conversation_group"] or "") != target_group:
+                    continue
+                if legacy["session_key"] == session_key:
+                    continue
+                conn.execute(
+                    "DELETE FROM opencode_active_sessions WHERE session_key = ?",
+                    (legacy["session_key"],),
+                )
+
             conn.execute(
                 """
                 INSERT INTO opencode_active_sessions (
@@ -772,6 +812,7 @@ class TaskStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_key) DO UPDATE SET
+                    agent_id = excluded.agent_id,
                     session_id = excluded.session_id,
                     updated_at = excluded.updated_at
                 """,
@@ -807,6 +848,7 @@ class TaskStore:
         conversation_group: str | None,
         cwd: str,
     ) -> None:
+        agent_id = normalize_agent_id(agent_id)
         session_key = self._active_opencode_session_key(
             agent_id=agent_id,
             conversation_group=conversation_group,
@@ -815,14 +857,35 @@ class TaskStore:
         now = _iso_utc(_now_utc())
         with self._connect() as conn:
             conn.execute("DELETE FROM opencode_active_sessions WHERE session_key = ?", (session_key,))
+            # Also clear legacy mixed-case keys for the same agent/cwd/group.
+            legacy_rows = conn.execute(
+                """
+                SELECT session_key, agent_id, conversation_group
+                FROM opencode_active_sessions
+                WHERE cwd = ?
+                """,
+                (cwd,),
+            ).fetchall()
+            target_group = conversation_group or ""
+            for legacy in legacy_rows:
+                if str(legacy["agent_id"] or "").lower() != agent_id:
+                    continue
+                if (legacy["conversation_group"] or "") != target_group:
+                    continue
+                conn.execute(
+                    "DELETE FROM opencode_active_sessions WHERE session_key = ?",
+                    (legacy["session_key"],),
+                )
+
             rows = conn.execute(
                 """
-                SELECT id, request_body_json
+                SELECT id, request_body_json, agent_id
                 FROM tasks
-                WHERE agent_id = ? AND cwd = ?
+                WHERE cwd = ?
+                  AND lower(agent_id) = ?
                   AND ((? IS NULL AND conversation_group IS NULL) OR conversation_group = ?)
                 """,
-                (agent_id, cwd, conversation_group, conversation_group),
+                (cwd, agent_id, conversation_group, conversation_group),
             ).fetchall()
             for row in rows:
                 try:
@@ -844,10 +907,11 @@ class TaskStore:
             conn.execute(
                 """
                 DELETE FROM opencode_sessions
-                WHERE agent_id = ? AND cwd = ?
+                WHERE cwd = ?
+                  AND lower(agent_id) = ?
                   AND ((? IS NULL AND conversation_group IS NULL) OR conversation_group = ?)
                 """,
-                (agent_id, cwd, conversation_group, conversation_group),
+                (cwd, agent_id, conversation_group, conversation_group),
             )
 
     def _opencode_session_key(
@@ -860,7 +924,7 @@ class TaskStore:
     ) -> str:
         identity = json.dumps(
             {
-                "agent_id": agent_id,
+                "agent_id": normalize_agent_id(agent_id) if agent_id else agent_id,
                 "conversation_id": conversation_id,
                 "conversation_group": conversation_group or "",
                 "cwd": cwd,
@@ -879,7 +943,7 @@ class TaskStore:
     ) -> str:
         identity = json.dumps(
             {
-                "agent_id": agent_id,
+                "agent_id": normalize_agent_id(agent_id) if agent_id else agent_id,
                 "conversation_group": conversation_group or "",
                 "cwd": cwd,
             },
@@ -907,8 +971,8 @@ class TaskStore:
         conditions = []
         params: list[Any] = []
         if agent_id:
-            conditions.append("agent_id = ?")
-            params.append(agent_id)
+            conditions.append("lower(agent_id) = ?")
+            params.append(normalize_agent_id(agent_id))
         if conversation_id:
             conditions.append("conversation_id = ?")
             params.append(conversation_id)

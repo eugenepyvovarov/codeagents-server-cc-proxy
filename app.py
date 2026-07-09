@@ -31,7 +31,7 @@ from claude_proxy.task_scheduler import (
     serialize_task,
     update_task_from_payload,
 )
-from claude_proxy.util import parse_int, sanitize_id
+from claude_proxy.util import normalize_agent_id, parse_int, sanitize_id
 
 logger = logging.getLogger(__name__)
 
@@ -698,7 +698,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
 
             if raw_agent_id:
                 try:
-                    agent_id = sanitize_id(raw_agent_id)
+                    agent_id = normalize_agent_id(raw_agent_id)
                 except ValueError as exc:
                     return JSONResponse(
                         status_code=200,
@@ -1034,7 +1034,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             if not isinstance(agent_id, str) or not agent_id.strip():
                 return json_error(400, error="bad_request", message="agent_id must be a non-empty string.")
             try:
-                body["agent_id"] = sanitize_id(agent_id)
+                body["agent_id"] = normalize_agent_id(agent_id)
             except ValueError as exc:
                 return json_error(400, error="bad_request", message=str(exc))
 
@@ -1344,7 +1344,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         conversation_group: str | None = None,
     ) -> JSONResponse:
         try:
-            agent_value = sanitize_id(agent_id) if agent_id else None
+            agent_value = normalize_agent_id(agent_id) if agent_id else None
             conversation_value = sanitize_id(conversation_id) if conversation_id else None
             group_value = sanitize_id(conversation_group) if conversation_group else None
         except ValueError as exc:
@@ -1365,7 +1365,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         agent_id = payload.get("agent_id")
         if not isinstance(agent_id, str) or not agent_id.strip():
             raise ValueError("agent_id is required.")
-        agent_id = sanitize_id(agent_id)
+        agent_id = normalize_agent_id(agent_id)
 
         conversation_group = payload.get("conversation_group")
         if isinstance(conversation_group, str) and conversation_group.strip():
@@ -1389,7 +1389,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         conversation_group: str | None = None,
     ) -> JSONResponse:
         try:
-            agent_value = sanitize_id(agent_id)
+            agent_value = normalize_agent_id(agent_id)
             group_value = sanitize_id(conversation_group) if conversation_group else None
         except ValueError as exc:
             return json_error(400, error="bad_request", message=str(exc))
@@ -1539,7 +1539,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if not agent_id:
             return json_error(400, error="bad_request", message="agent_id is required.")
         try:
-            agent_value = sanitize_id(agent_id)
+            agent_value = normalize_agent_id(agent_id)
         except ValueError as exc:
             return json_error(400, error="bad_request", message=str(exc))
 
@@ -1561,7 +1561,7 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if not isinstance(agent_id, str) or not agent_id.strip():
             return json_error(400, error="bad_request", message="agent_id is required.")
         try:
-            agent_value = sanitize_id(agent_id)
+            agent_value = normalize_agent_id(agent_id)
         except ValueError as exc:
             return json_error(400, error="bad_request", message=str(exc))
 

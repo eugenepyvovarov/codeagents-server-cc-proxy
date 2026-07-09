@@ -1534,6 +1534,36 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             headers=proxy_headers(),
         )
 
+    @app.post("/v1/agent/tasks/{task_id}/run")
+    async def run_task_now(task_id: str) -> JSONResponse:
+        """Start a manual run immediately without advancing the schedule."""
+        try:
+            task_id = sanitize_id(task_id)
+        except ValueError as exc:
+            return json_error(400, error="bad_request", message=str(exc))
+
+        existing = await task_store.get_task(task_id)
+        if existing is None:
+            return json_error(404, error="task_not_found", task_id=task_id)
+
+        try:
+            stored = await task_scheduler.run_now(task_id)
+        except KeyError:
+            return json_error(404, error="task_not_found", task_id=task_id)
+        except Exception as exc:
+            logger.exception("Failed to start manual task run: %s", task_id)
+            return json_error(500, error="task_run_failed", message=str(exc))
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "ok": True,
+                "started": True,
+                "task": serialize_task(stored),
+            },
+            headers=proxy_headers(),
+        )
+
     @app.get("/v1/agent/env")
     async def list_env(agent_id: str | None = None) -> JSONResponse:
         if not agent_id:

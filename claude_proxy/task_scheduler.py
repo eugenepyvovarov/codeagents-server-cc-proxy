@@ -1287,6 +1287,58 @@ class TaskScheduler:
             pass
         await self._store.delete_task(task_id)
 
+    async def run_now(self, task_id: str) -> TaskRecord:
+        """Trigger an immediate manual run without advancing the cron next_run_at.
+
+        Returns the current task snapshot immediately. Execution continues in the
+        background so HTTP clients are not blocked for long OpenCode runs.
+        """
+        task = await self._store.get_task(task_id)
+        if task is None:
+            raise KeyError(task_id)
+
+        # Clear a previous sticky error so the UI shows the new attempt cleanly.
+        await self._store.update_run_times(
+            task_id,
+            last_run_at=task.last_run_at,
+            last_error=None,
+        )
+        refreshed = await self._store.get_task(task_id) or task
+        asyncio.create_task(self._run_manual_job(task_id), name=f"task-run-now-{task_id}")
+        return refreshed
+
+    async def _run_manual_job(self, task_id: str) -> None:
+        task = await self._store.get_task(task_id)
+        if task is None:
+            return
+
+        scheduled_at = _now_utc()
+        try:
+            started = await self._start_task_run(task)
+        except AgentFolderBusyError:
+            await self._enqueue_pending(task, scheduled_at)
+            await self._store.update_run_times(
+                task_id,
+                last_error="Queued: agent is busy on this project",
+            )
+            return
+        except Exception as exc:
+            logger.exception("Manual task run failed: %s", task_id)
+            await self._store.update_run_times(task_id, last_error=str(exc))
+            return
+
+        if not started:
+            await self._enqueue_pending(task, scheduled_at)
+            await self._store.update_run_times(
+                task_id,
+                last_error="Queued: OpenCode session is busy",
+            )
+            return
+
+        await self._store.update_run_times(task_id, last_run_at=_now_utc(), last_error=None)
+        if getattr(self._task_runner, "start_run_waits_for_completion", False):
+            await self._drain_pending(task.cwd)
+
     async def on_run_finished(self, cwd: str) -> None:
         await self._drain_pending(cwd)
 

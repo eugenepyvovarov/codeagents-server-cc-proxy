@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -142,5 +143,66 @@ async def test_create_and_update_return_scheduled_next_run(tmp_path):
         persisted = await store.get_task(created.id)
         assert persisted is not None
         assert persisted.next_run_at == updated.next_run_at
+    finally:
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_run_now_clears_error_and_does_not_advance_schedule(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    scheduler = TaskScheduler(store=store, task_runner=NoopTaskRunner())
+    await scheduler.start()
+    try:
+        anchor = datetime(2026, 3, 1, 9, 0, tzinfo=timezone.utc)
+        next_run = datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)
+        record = TaskRecord(
+            id="task-run-now",
+            agent_id="agent",
+            conversation_id="conversation",
+            conversation_group=None,
+            cwd="/tmp/project",
+            title="Run me",
+            prompt="ping",
+            enabled=True,
+            time_zone="UTC",
+            schedule=TaskSchedule(
+                frequency="daily",
+                interval=1,
+                weekday_mask=0,
+                monthly_mode="day_of_month",
+                day_of_month=1,
+                weekday_ordinal="first",
+                weekday=1,
+                month=1,
+                time_minutes=540,
+            ),
+            anchor_at=anchor,
+            next_run_at=next_run,
+            last_run_at=None,
+            last_error="previous failure",
+            request_body={},
+            created_at=anchor,
+            updated_at=anchor,
+        )
+        await store.create_task(record)
+
+        started = await scheduler.run_now(record.id)
+        assert started.last_error is None
+        assert started.next_run_at == next_run
+
+        # Background job should mark last_run_at without changing next_run.
+        for _ in range(20):
+            refreshed = await store.get_task(record.id)
+            assert refreshed is not None
+            assert refreshed.next_run_at == next_run
+            if refreshed.last_run_at is not None and refreshed.last_error is None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            refreshed = await store.get_task(record.id)
+            assert refreshed is not None
+            assert refreshed.last_run_at is not None
+            assert refreshed.last_error is None
+            assert refreshed.next_run_at == next_run
     finally:
         await scheduler.shutdown()

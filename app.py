@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -75,7 +76,8 @@ def hmac_compare(presented: str, expected: str) -> bool:
     """Constant-time compare for bearer tokens."""
     if not presented or not expected or len(presented) != len(expected):
         return False
-    return hashlib.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+    # Use hmac.compare_digest — hashlib has no compare_digest on some runtimes.
+    return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _run_command(args: list[str], *, cwd: Path) -> str:

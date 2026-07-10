@@ -186,8 +186,15 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     @app.middleware("http")
     async def require_daemon_auth(request: Request, call_next):
         path = request.url.path or ""
-        # Health remains unauthenticated for soft probes and install verification.
+        # Health: soft probes / install verification.
         if path == "/healthz" or path.startswith("/healthz/"):
+            return await call_next(request)
+        # Loopback MCP for OpenCode (managed scheduler). OpenCode cannot attach
+        # arbitrary Bearer headers to MCP transports; keep MCP on 127.0.0.1 only.
+        if path == "/mcp" or path.startswith("/mcp/"):
+            return await call_next(request)
+        # OpenCode probes these after MCP 401; avoid auth noise / OAuth discovery loops.
+        if path.startswith("/.well-known/") or path == "/register":
             return await call_next(request)
         expected = _daemon_auth_token() or auth_token
         if not expected:

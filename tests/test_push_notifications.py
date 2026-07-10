@@ -61,5 +61,6 @@ async def test_trigger_reply_finished_posts_to_mocked_gateway(monkeypatch: pytes
             "conversation_id": "ses_fixture",
             "renderable_assistant_count": 3,
             "message_preview": "scheduled task complete",
+            "include_preview": True,
         },
     }

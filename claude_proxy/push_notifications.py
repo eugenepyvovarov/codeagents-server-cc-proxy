@@ -96,7 +96,10 @@ async def trigger_reply_finished(
     if message_preview:
         normalized = _normalize_preview(message_preview)
         if normalized:
+            # Gateway ignores message_preview unless include_preview is true
+            # (default lock-screen body is "Reply ready").
             payload["message_preview"] = normalized
+            payload["include_preview"] = True
 
     try:
         result = await asyncio.to_thread(_post_json, url, secret=secret, payload=payload)

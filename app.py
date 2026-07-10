@@ -47,11 +47,35 @@ def _normalize_env_key(value: str) -> str:
 
 
 def _get_update_interval_seconds() -> int:
-    raw = os.environ.get("CLAUDE_PROXY_UPDATE_INTERVAL_SECONDS", "600")
+    # Default 0 = disabled. Blind auto-follow of origin is a supply-chain risk;
+    # upgrades are driven by the app's pinned install revision.
+    raw = os.environ.get("CLAUDE_PROXY_UPDATE_INTERVAL_SECONDS", "0")
     try:
         return int(raw)
     except ValueError:
-        return 21600
+        return 0
+
+
+def _daemon_auth_token() -> str:
+    return (
+        os.environ.get("CODEAGENTS_DAEMON_TOKEN", "").strip()
+        or os.environ.get("CLAUDE_PROXY_AUTH_TOKEN", "").strip()
+    )
+
+
+def _mask_secret_value(value: str) -> str:
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "****"
+    return f"{value[:2]}…{value[-2:]} ({len(value)} chars)"
+
+
+def hmac_compare(presented: str, expected: str) -> bool:
+    """Constant-time compare for bearer tokens."""
+    if not presented or not expected or len(presented) != len(expected):
+        return False
+    return hashlib.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _run_command(args: list[str], *, cwd: Path) -> str:
@@ -132,6 +156,12 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
     repo_dir = Path(__file__).resolve().parent
     version = _git_sha(repo_dir)
     started_at = _now_iso()
+    auth_token = _daemon_auth_token()
+    if not auth_token:
+        logger.warning(
+            "Daemon auth token not set (CODEAGENTS_DAEMON_TOKEN); "
+            "non-health endpoints remain open to local processes"
+        )
 
     def proxy_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {
@@ -141,6 +171,34 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
         if extra:
             headers.update(extra)
         return headers
+
+    def _extract_bearer(request: Request) -> str | None:
+        auth = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        token_header = request.headers.get("x-codeagents-token") or request.headers.get("X-CodeAgents-Token")
+        if token_header:
+            return token_header.strip()
+        return None
+
+    @app.middleware("http")
+    async def require_daemon_auth(request: Request, call_next):
+        path = request.url.path or ""
+        # Health remains unauthenticated for soft probes and install verification.
+        if path == "/healthz" or path.startswith("/healthz/"):
+            return await call_next(request)
+        expected = _daemon_auth_token() or auth_token
+        if not expected:
+            # Fail open only when no token is configured (legacy installs).
+            return await call_next(request)
+        presented = _extract_bearer(request)
+        if not presented or not hmac_compare(presented, expected):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized", "message": "Valid bearer token required."},
+                headers=proxy_headers(),
+            )
+        return await call_next(request)
 
     async def _maybe_update() -> None:
         if update_lock.locked():
@@ -490,6 +548,9 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
                 "name": MCP_TOOL_NAME_CREATE,
                 "description": (
                     "Create a scheduled task for the active project. "
+                    "frequency may be minutely, hourly, daily, weekly, monthly, yearly, or once. "
+                    "For once, pass day_of_month, month, time_minutes, and optional next_run_at (ISO); "
+                    "the task disables and deletes itself after a successful run. "
                     "time_minutes is wall-clock minutes from midnight in time_zone "
                     "(e.g. 540 = 09:00). Always pass time_zone as an IANA id "
                     "(e.g. Europe/Berlin) matching the user's local timezone unless they specify otherwise. "
@@ -1574,9 +1635,20 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return json_error(400, error="bad_request", message=str(exc))
 
         env = await task_store.list_env(agent_id=agent_value)
+        # Never return plaintext secret values after creation — mask for listing.
+        masked: list[dict[str, Any]] = []
+        for item in env:
+            if not isinstance(item, dict):
+                continue
+            entry = dict(item)
+            raw_value = entry.get("value")
+            if isinstance(raw_value, str):
+                entry["value"] = _mask_secret_value(raw_value)
+                entry["has_value"] = bool(raw_value)
+            masked.append(entry)
         return JSONResponse(
             status_code=200,
-            content={"env": env},
+            content={"env": masked},
             headers=proxy_headers(),
         )
 

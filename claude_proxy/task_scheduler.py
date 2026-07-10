@@ -6,7 +6,7 @@ import json
 import logging
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -192,18 +192,53 @@ def _normalize_time_zone(value: Any) -> str:
     return zone
 
 
+_ONCE_RETRY_MINUTES = 5
+
+
+def _resolve_once_fire_time(
+    payload: dict[str, Any],
+    schedule: TaskSchedule,
+    *,
+    time_zone: str,
+    now_local: datetime,
+) -> datetime:
+    """Absolute UTC fire time for a one-shot task.
+
+    Prefers explicit next_run_at / run_at, otherwise builds from schedule
+    month/day/time_minutes in the task timezone (year from payload or local now).
+    """
+    for key in ("next_run_at", "run_at"):
+        raw = payload.get(key)
+        if isinstance(raw, str) and raw.strip():
+            parsed = _parse_iso(raw.strip())
+            if parsed is not None:
+                return parsed.astimezone(timezone.utc)
+
+    schedule_dict = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {}
+    year = _normalize_int(
+        payload.get("year") if payload.get("year") is not None else schedule_dict.get("year"),
+        now_local.year,
+    )
+    year = max(1970, min(year, 2100))
+    day = min(schedule.day_of_month, _last_day_of_month(year, schedule.month))
+    local_dt = _combine_local(date(year, schedule.month, day), schedule.time_minutes, ZoneInfo(time_zone))
+    return local_dt.astimezone(timezone.utc)
+
+
 def _normalize_schedule(value: Any, *, now: datetime) -> TaskSchedule:
     if not isinstance(value, dict):
         raise TaskValidationError("schedule must be an object")
 
     frequency = str(value.get("frequency") or "daily").strip().lower()
-    if frequency not in {"minutely", "hourly", "daily", "weekly", "monthly", "yearly"}:
+    if frequency not in {"minutely", "hourly", "daily", "weekly", "monthly", "yearly", "once"}:
         raise TaskValidationError(
-            "schedule.frequency must be minutely, hourly, daily, weekly, monthly, or yearly"
+            "schedule.frequency must be minutely, hourly, daily, weekly, monthly, yearly, or once"
         )
 
     interval = max(1, _normalize_int(value.get("interval"), 1))
-    if frequency == "minutely":
+    if frequency == "once":
+        interval = 1
+    elif frequency == "minutely":
         interval = min(interval, 60)
     elif frequency == "hourly":
         interval = min(interval, 24)
@@ -291,6 +326,13 @@ def parse_task_payload(payload: dict[str, Any]) -> TaskRecord:
     request_body = _build_request_body(payload)
 
     now_utc = _now_utc()
+    anchor_at = now_utc
+    next_run_at: datetime | None = None
+    if schedule.frequency == "once":
+        # One-shot fire time is stored on anchor_at so reloads stay correct.
+        anchor_at = _resolve_once_fire_time(payload, schedule, time_zone=time_zone, now_local=now)
+        next_run_at = anchor_at
+
     return TaskRecord(
         id=uuid.uuid4().hex,
         agent_id=agent_id,
@@ -302,8 +344,8 @@ def parse_task_payload(payload: dict[str, Any]) -> TaskRecord:
         enabled=enabled,
         time_zone=time_zone,
         schedule=schedule,
-        anchor_at=now_utc,
-        next_run_at=None,
+        anchor_at=anchor_at,
+        next_run_at=next_run_at,
         last_run_at=None,
         last_error=None,
         request_body=request_body,
@@ -347,8 +389,8 @@ def update_task_from_payload(existing: TaskRecord, payload: dict[str, Any]) -> T
         conversation_group = sanitize_id(group_value) if group_value else None
 
     schedule = existing.schedule
+    now_local = _now_utc().astimezone(ZoneInfo(time_zone))
     if "schedule" in payload:
-        now_local = _now_utc().astimezone(ZoneInfo(time_zone))
         schedule = _normalize_schedule(payload.get("schedule"), now=now_local)
 
     request_body = dict(existing.request_body)
@@ -361,10 +403,21 @@ def update_task_from_payload(existing: TaskRecord, payload: dict[str, Any]) -> T
         request_body.setdefault("conversation_group", conversation_group)
 
     anchor_at = existing.anchor_at
-    if schedule != existing.schedule or time_zone != existing.time_zone:
+    schedule_changed = schedule != existing.schedule or time_zone != existing.time_zone
+    explicit_once_time = schedule.frequency == "once" and (
+        "next_run_at" in payload or "run_at" in payload or "schedule" in payload
+    )
+    if schedule.frequency == "once" and (schedule_changed or explicit_once_time):
+        anchor_at = _resolve_once_fire_time(payload, schedule, time_zone=time_zone, now_local=now_local)
+    elif schedule_changed:
         anchor_at = _now_utc()
 
     now_utc = _now_utc()
+    next_run_at = existing.next_run_at
+    if schedule.frequency == "once" and (schedule_changed or explicit_once_time):
+        # Force reschedule from the new fire time.
+        next_run_at = None
+
     return TaskRecord(
         id=existing.id,
         agent_id=existing.agent_id,
@@ -377,7 +430,7 @@ def update_task_from_payload(existing: TaskRecord, payload: dict[str, Any]) -> T
         time_zone=time_zone,
         schedule=schedule,
         anchor_at=anchor_at,
-        next_run_at=existing.next_run_at,
+        next_run_at=next_run_at,
         last_run_at=existing.last_run_at,
         last_error=existing.last_error,
         request_body=request_body,
@@ -1312,6 +1365,7 @@ class TaskScheduler:
         if task is None:
             return
 
+        is_once = task.schedule.frequency == "once"
         scheduled_at = _now_utc()
         try:
             started = await self._start_task_run(task)
@@ -1325,6 +1379,8 @@ class TaskScheduler:
         except Exception as exc:
             logger.exception("Manual task run failed: %s", task_id)
             await self._store.update_run_times(task_id, last_error=str(exc))
+            if is_once:
+                await self._schedule_once_retry(task_id)
             return
 
         if not started:
@@ -1336,6 +1392,13 @@ class TaskScheduler:
             return
 
         await self._store.update_run_times(task_id, last_run_at=_now_utc(), last_error=None)
+        if is_once:
+            # OpenCode runner waits until idle; True means the reply finished.
+            await self._retire_once_task(task_id)
+            if getattr(self._task_runner, "start_run_waits_for_completion", False):
+                await self._drain_pending(task.cwd)
+            return
+
         if getattr(self._task_runner, "start_run_waits_for_completion", False):
             await self._drain_pending(task.cwd)
 
@@ -1372,7 +1435,11 @@ class TaskScheduler:
         if task is None or not task.enabled:
             return
 
-        await self._schedule_next(task, scheduled_at)
+        is_once = task.schedule.frequency == "once"
+        # Recurring tasks advance the schedule before the run so a long run
+        # does not skip the next slot. One-shots must not re-arm on success.
+        if not is_once:
+            await self._schedule_next(task, scheduled_at)
 
         try:
             started = await self._start_task_run(task)
@@ -1382,6 +1449,8 @@ class TaskScheduler:
         except Exception as exc:
             logger.exception("Task run failed: %s", task_id)
             await self._store.update_run_times(task_id, last_error=str(exc))
+            if is_once:
+                await self._schedule_once_retry(task_id)
             return
 
         if not started:
@@ -1389,6 +1458,12 @@ class TaskScheduler:
             return
 
         await self._store.update_run_times(task_id, last_run_at=_now_utc(), last_error=None)
+        if is_once:
+            await self._retire_once_task(task_id)
+            if getattr(self._task_runner, "start_run_waits_for_completion", False):
+                await self._drain_pending(task.cwd)
+            return
+
         if getattr(self._task_runner, "start_run_waits_for_completion", False):
             await self._drain_pending(task.cwd)
 
@@ -1407,6 +1482,55 @@ class TaskScheduler:
             replace_existing=True,
             misfire_grace_time=300,
         )
+
+    async def _schedule_once_retry(self, task_id: str) -> None:
+        """Re-arm a one-shot after a failed attempt (keep enabled until success)."""
+        task = await self._store.get_task(task_id)
+        if task is None or not task.enabled or task.schedule.frequency != "once":
+            return
+        next_run = _now_utc() + timedelta(minutes=_ONCE_RETRY_MINUTES)
+        await self._store.update_run_times(task_id, next_run_at=next_run)
+        self._scheduler.add_job(
+            self._run_task_job,
+            trigger=DateTrigger(run_date=next_run),
+            args=[task_id, next_run],
+            id=task_id,
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        logger.info(
+            "One-time task %s failed; retry scheduled at %s",
+            task_id,
+            _iso_utc(next_run),
+        )
+
+    async def _retire_once_task(self, task_id: str) -> None:
+        """Disable then delete a one-shot after a successful completed run."""
+        task = await self._store.get_task(task_id)
+        if task is None:
+            return
+
+        logger.info("Retiring one-time task after successful run: %s", task_id)
+        disabled = replace(
+            task,
+            enabled=False,
+            next_run_at=None,
+            updated_at=_now_utc(),
+        )
+        try:
+            await self._store.update_task(task_id, disabled)
+        except Exception as exc:
+            logger.warning("Failed to disable one-time task %s: %s", task_id, exc)
+
+        try:
+            self._scheduler.remove_job(task_id)
+        except JobLookupError:
+            pass
+
+        try:
+            await self._store.delete_task(task_id)
+        except Exception as exc:
+            logger.warning("Failed to delete one-time task %s: %s", task_id, exc)
 
     async def _start_task_run(self, task: TaskRecord) -> bool:
         request_body = dict(task.request_body)
@@ -1483,6 +1607,7 @@ class TaskScheduler:
             if task is None or not task.enabled:
                 continue
 
+            is_once = task.schedule.frequency == "once"
             try:
                 started = await self._start_task_run(task)
             except AgentFolderBusyError:
@@ -1493,6 +1618,8 @@ class TaskScheduler:
             except Exception as exc:
                 logger.exception("Pending run failed: %s", pending.task_id)
                 await self._store.update_run_times(pending.task_id, last_error=str(exc))
+                if is_once:
+                    await self._schedule_once_retry(pending.task_id)
                 continue
 
             if not started:
@@ -1502,6 +1629,8 @@ class TaskScheduler:
                 return
 
             await self._store.update_run_times(task.id, last_run_at=_now_utc(), last_error=None)
+            if is_once:
+                await self._retire_once_task(task.id)
 
 
 def compute_next_run(task: TaskRecord, *, after: datetime) -> datetime:
@@ -1510,6 +1639,15 @@ def compute_next_run(task: TaskRecord, *, after: datetime) -> datetime:
     anchor_local = task.anchor_at.astimezone(tz)
     schedule = task.schedule
     time_minutes = schedule.time_minutes
+
+    if schedule.frequency == "once":
+        # Primary fire is anchor_at. Overdue one-shots fire ASAP; failed runs
+        # re-arm via _schedule_once_retry (short delay), not this path.
+        fire = task.anchor_at.astimezone(timezone.utc)
+        after_utc = after.astimezone(timezone.utc)
+        if fire > after_utc:
+            return fire
+        return (after_utc + timedelta(seconds=1)).astimezone(timezone.utc)
 
     if schedule.frequency == "minutely":
         anchor_start = _combine_local(anchor_local.date(), 0, tz)

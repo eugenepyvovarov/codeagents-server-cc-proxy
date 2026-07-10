@@ -206,3 +206,150 @@ async def test_run_now_clears_error_and_does_not_advance_schedule(tmp_path):
             assert refreshed.next_run_at == next_run
     finally:
         await scheduler.shutdown()
+
+
+def test_parse_and_compute_once_uses_next_run_at_as_anchor():
+    fire = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
+    record = parse_task_payload(
+        {
+            "agent_id": "agent-123",
+            "conversation_id": "conv-123",
+            "cwd": "/tmp/project",
+            "prompt": "one shot",
+            "enabled": True,
+            "time_zone": "UTC",
+            "next_run_at": "2026-07-15T09:00:00Z",
+            "schedule": {
+                "frequency": "once",
+                "time_minutes": 540,
+                "day_of_month": 15,
+                "month": 7,
+            },
+        }
+    )
+    assert record.schedule.frequency == "once"
+    assert record.anchor_at == fire
+    assert record.next_run_at == fire
+
+    before = datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+    assert compute_next_run(record, after=before) == fire
+
+    after = datetime(2026, 7, 16, 0, 0, tzinfo=timezone.utc)
+    overdue = compute_next_run(record, after=after)
+    assert overdue > after
+    assert (overdue - after).total_seconds() <= 2
+
+
+@pytest.mark.asyncio
+async def test_once_task_retires_after_successful_run(tmp_path):
+    store = TaskStore(tmp_path / "tasks-once.db")
+    scheduler = TaskScheduler(store=store, task_runner=NoopTaskRunner())
+    await scheduler.start()
+    try:
+        fire = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
+        record = parse_task_payload(
+            {
+                "agent_id": "agent-123",
+                "conversation_id": "conv-123",
+                "cwd": "/tmp/project",
+                "prompt": "one shot",
+                "enabled": True,
+                "time_zone": "UTC",
+                "next_run_at": "2026-07-15T09:00:00Z",
+                "schedule": {
+                    "frequency": "once",
+                    "time_minutes": 540,
+                    "day_of_month": 15,
+                    "month": 7,
+                },
+            }
+        )
+        created = await scheduler.create_task(record)
+        assert created.next_run_at is not None
+
+        await scheduler._run_task_job(created.id, fire)
+
+        assert await store.get_task(created.id) is None
+    finally:
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_once_task_retries_after_failed_run(tmp_path):
+    class FailingRunner:
+        async def start_run(self, *, conversation_id: str, prompt: str, request_body: dict) -> bool:
+            _ = conversation_id
+            _ = prompt
+            _ = request_body
+            raise RuntimeError("boom")
+
+    store = TaskStore(tmp_path / "tasks-once-fail.db")
+    scheduler = TaskScheduler(store=store, task_runner=FailingRunner())
+    await scheduler.start()
+    try:
+        fire = datetime(2026, 7, 15, 9, 0, tzinfo=timezone.utc)
+        record = parse_task_payload(
+            {
+                "agent_id": "agent-123",
+                "conversation_id": "conv-123",
+                "cwd": "/tmp/project",
+                "prompt": "one shot",
+                "enabled": True,
+                "time_zone": "UTC",
+                "next_run_at": "2026-07-15T09:00:00Z",
+                "schedule": {
+                    "frequency": "once",
+                    "time_minutes": 540,
+                    "day_of_month": 15,
+                    "month": 7,
+                },
+            }
+        )
+        created = await scheduler.create_task(record)
+        await scheduler._run_task_job(created.id, fire)
+
+        persisted = await store.get_task(created.id)
+        assert persisted is not None
+        assert persisted.enabled is True
+        assert persisted.last_error is not None
+        assert "boom" in (persisted.last_error or "")
+        assert persisted.next_run_at is not None
+        # Retry is scheduled ~5 minutes from failure time (wall clock), not from fire.
+        assert persisted.next_run_at > datetime.now(timezone.utc)
+    finally:
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_once_run_now_retires_after_success(tmp_path):
+    store = TaskStore(tmp_path / "tasks-once-runnow.db")
+    scheduler = TaskScheduler(store=store, task_runner=NoopTaskRunner())
+    await scheduler.start()
+    try:
+        record = parse_task_payload(
+            {
+                "agent_id": "agent-123",
+                "conversation_id": "conv-123",
+                "cwd": "/tmp/project",
+                "prompt": "one shot now",
+                "enabled": True,
+                "time_zone": "UTC",
+                "next_run_at": "2099-01-01T09:00:00Z",
+                "schedule": {
+                    "frequency": "once",
+                    "time_minutes": 540,
+                    "day_of_month": 1,
+                    "month": 1,
+                },
+            }
+        )
+        created = await scheduler.create_task(record)
+        await scheduler.run_now(created.id)
+        # run_now fires background task; wait briefly
+        for _ in range(50):
+            if await store.get_task(created.id) is None:
+                break
+            await asyncio.sleep(0.05)
+        assert await store.get_task(created.id) is None
+    finally:
+        await scheduler.shutdown()

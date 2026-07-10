@@ -100,6 +100,13 @@ Create payload:
 }
 ```
 
+Frequencies: `minutely`, `hourly`, `daily`, `weekly`, `monthly`, `yearly`, or `once`.
+
+One-shot example (`frequency: "once"`). Pass absolute `next_run_at` (ISO-8601) and/or
+`day_of_month` + `month` + `time_minutes` in `time_zone`. After a **successful** run finishes,
+the daemon disables the task and deletes it. Failed runs stay enabled and retry after ~5 minutes.
+`POST /v1/agent/tasks/{id}/run` (Run Now) uses the same lifecycle for once tasks.
+
 Tasks are stored in `data/tasks.db` and executed by an in-process scheduler. If the agent is already
 running, the proxy queues the task and runs it as soon as the folder is free.
 

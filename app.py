@@ -202,6 +202,15 @@ def create_app(*, store_dir: Path | None = None, backend=default_backend) -> Fas
             return await call_next(request)
         presented = _extract_bearer(request)
         if not presented or not hmac_compare(presented, expected):
+            # Do not log token values — only presence/length for support diagnosis.
+            logger.warning(
+                "daemon auth 401 path=%s method=%s presented=%s presented_len=%s expected_len=%s",
+                path,
+                request.method,
+                "yes" if presented else "no",
+                len(presented) if presented else 0,
+                len(expected),
+            )
             return JSONResponse(
                 status_code=401,
                 content={"error": "unauthorized", "message": "Valid bearer token required."},

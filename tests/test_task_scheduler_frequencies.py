@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,8 +9,10 @@ from claude_proxy.task_scheduler import (
     TaskSchedule,
     TaskScheduler,
     TaskStore,
+    PendingRun,
     compute_next_run,
     parse_task_payload,
+    serialize_task,
 )
 
 
@@ -143,6 +145,81 @@ async def test_create_and_update_return_scheduled_next_run(tmp_path):
         persisted = await store.get_task(created.id)
         assert persisted is not None
         assert persisted.next_run_at == updated.next_run_at
+    finally:
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_create_is_idempotent_for_client_task_id(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    scheduler = TaskScheduler(store=store, task_runner=NoopTaskRunner())
+    await scheduler.start()
+    try:
+        payload = {
+            "agent_id": "agent-123",
+            "conversation_id": "conv-123",
+            "cwd": "/tmp/project",
+            "prompt": "scheduled ping",
+            "enabled": True,
+            "time_zone": "UTC",
+            "client_task_id": "local-task-123",
+            "schedule": {"frequency": "hourly", "interval": 1},
+        }
+
+        first = await scheduler.create_task(parse_task_payload(payload))
+        second = await scheduler.create_task(parse_task_payload(payload))
+
+        assert second.id == first.id
+        assert len(await store.list_tasks()) == 1
+        assert serialize_task(second)["client_task_id"] == "local-task-123"
+    finally:
+        await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_runs_coalesce_and_startup_discards_stale_entries(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    now = datetime.now(timezone.utc)
+    record = _task_record(
+        time_zone="UTC",
+        schedule=TaskSchedule(
+            frequency="daily",
+            interval=1,
+            weekday_mask=1,
+            monthly_mode="day_of_month",
+            day_of_month=1,
+            weekday_ordinal="first",
+            weekday=1,
+            month=1,
+            time_minutes=540,
+        ),
+        anchor_at=now,
+    )
+    await store.create_task(record)
+
+    def pending(identifier: str, enqueued_at: datetime) -> PendingRun:
+        return PendingRun(
+            id=identifier,
+            task_id=record.id,
+            agent_id=record.agent_id,
+            conversation_id=record.conversation_id,
+            conversation_group=None,
+            cwd=record.cwd,
+            prompt=record.prompt,
+            request_body={},
+            scheduled_at=enqueued_at,
+            enqueued_at=enqueued_at,
+        )
+
+    await store.enqueue_pending(pending("first", now - timedelta(minutes=2)))
+    await store.enqueue_pending(pending("second", now - timedelta(minutes=1)))
+    assert (await store.pop_pending_for_cwd(record.cwd)).id == "second"
+
+    await store.enqueue_pending(pending("stale", now - timedelta(hours=2)))
+    scheduler = TaskScheduler(store=store, task_runner=NoopTaskRunner())
+    await scheduler.start()
+    try:
+        assert await store.pop_pending_for_cwd(record.cwd) is None
     finally:
         await scheduler.shutdown()
 

@@ -48,12 +48,16 @@ class OpenCodeClient:
         password: str | None = None,
         timeout: float = 2.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        environment: Mapping[str, str] | None = None,
+        env_file_paths: tuple[Path, ...] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
         self.timeout = timeout
         self._transport = transport
+        self._environment = environment
+        self._env_file_paths = env_file_paths
 
     @classmethod
     def from_environment(
@@ -87,7 +91,56 @@ class OpenCodeClient:
             password=password,
             timeout=timeout,
             transport=transport,
+            environment=resolved_env,
+            env_file_paths=env_file_paths,
         )
+
+    def _reload_environment(self) -> tuple[str, str, str | None]:
+        if self._environment is None or self._env_file_paths is None:
+            return self.base_url, self.username, self.password
+
+        env_file_values: dict[str, str] = {}
+        for path in self._env_file_paths:
+            env_file_values.update(parse_env_file(path))
+
+        self.base_url = (
+            self._environment.get("OPENCODE_BASE_URL")
+            or env_file_values.get("OPENCODE_BASE_URL")
+            or DEFAULT_OPENCODE_BASE_URL
+        ).rstrip("/")
+        self.username = (
+            self._environment.get("OPENCODE_SERVER_USERNAME")
+            or env_file_values.get("OPENCODE_SERVER_USERNAME")
+            or DEFAULT_OPENCODE_USERNAME
+        )
+        self.password = (
+            self._environment.get("OPENCODE_SERVER_PASSWORD")
+            or env_file_values.get("OPENCODE_SERVER_PASSWORD")
+        )
+        return self.base_url, self.username, self.password
+
+    async def _request_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Mapping[str, Any] | None,
+        params: Mapping[str, Any] | None,
+        base_url: str,
+        username: str,
+        password: str | None,
+    ) -> httpx.Response:
+        auth: tuple[str, str] | None = None
+        if password:
+            auth = (username, password)
+
+        async with httpx.AsyncClient(
+            base_url=base_url,
+            timeout=self.timeout,
+            auth=auth,
+            transport=self._transport,
+        ) as client:
+            return await client.request(method, path, json=json, params=params)
 
     async def request(
         self,
@@ -100,21 +153,37 @@ class OpenCodeClient:
         if not path.startswith("/"):
             raise ValueError("OpenCode path must start with /")
 
-        auth: tuple[str, str] | None = None
-        if self.password:
-            auth = (self.username, self.password)
+        initial_config = (self.base_url, self.username, self.password)
+        response = await self._request_once(
+            method,
+            path,
+            json=json,
+            params=params,
+            base_url=initial_config[0],
+            username=initial_config[1],
+            password=initial_config[2],
+        )
 
-        async with httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=self.timeout,
-            auth=auth,
-            transport=self._transport,
-        ) as client:
-            response = await client.request(method, path, json=json, params=params)
-            response.raise_for_status()
-            if not response.content:
-                return None
-            return response.json()
+        # OpenCode credentials can be rotated independently of this long-lived
+        # daemon. A 401 is rejected before OpenCode executes the request, so it
+        # is safe to reload the managed env file and retry once when auth changed.
+        if response.status_code == 401 and self._env_file_paths is not None:
+            refreshed_config = self._reload_environment()
+            if refreshed_config != initial_config:
+                response = await self._request_once(
+                    method,
+                    path,
+                    json=json,
+                    params=params,
+                    base_url=refreshed_config[0],
+                    username=refreshed_config[1],
+                    password=refreshed_config[2],
+                )
+
+        response.raise_for_status()
+        if not response.content:
+            return None
+        return response.json()
 
     async def health(self) -> dict[str, Any]:
         response = await self.request("GET", "/global/health")

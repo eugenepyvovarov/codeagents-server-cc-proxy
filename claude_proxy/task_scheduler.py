@@ -21,6 +21,7 @@ from claude_proxy.util import normalize_agent_id, sanitize_id
 
 logger = logging.getLogger(__name__)
 _MISSING = object()
+_PENDING_RUN_MAX_AGE = timedelta(hours=1)
 
 
 def _now_utc() -> datetime:
@@ -454,7 +455,7 @@ def _schedule_to_dict(schedule: TaskSchedule) -> dict[str, Any]:
 
 
 def serialize_task(task: TaskRecord) -> dict[str, Any]:
-    return {
+    payload = {
         "id": task.id,
         "agent_id": task.agent_id,
         "conversation_id": task.conversation_id,
@@ -471,6 +472,10 @@ def serialize_task(task: TaskRecord) -> dict[str, Any]:
         "created_at": _iso_utc(task.created_at),
         "updated_at": _iso_utc(task.updated_at),
     }
+    client_task_id = task.request_body.get("client_task_id")
+    if isinstance(client_task_id, str) and client_task_id.strip():
+        payload["client_task_id"] = client_task_id.strip()
+    return payload
 
 
 class TaskStore:
@@ -1062,6 +1067,21 @@ class TaskStore:
         columns = ", ".join(payload.keys())
         placeholders = ", ".join(["?"] * len(payload))
         with self._connect() as conn:
+            client_task_id = record.request_body.get("client_task_id")
+            if isinstance(client_task_id, str) and client_task_id.strip():
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE lower(agent_id) = ? AND cwd = ?",
+                    (normalize_agent_id(record.agent_id), record.cwd),
+                ).fetchall()
+                normalized_client_id = client_task_id.strip().lower()
+                for row in rows:
+                    existing = self._row_to_task(row)
+                    existing_client_id = existing.request_body.get("client_task_id")
+                    if (
+                        isinstance(existing_client_id, str)
+                        and existing_client_id.strip().lower() == normalized_client_id
+                    ):
+                        return existing
             conn.execute(
                 f"INSERT INTO tasks ({columns}) VALUES ({placeholders})",
                 list(payload.values()),
@@ -1160,10 +1180,55 @@ class TaskStore:
         columns = ", ".join(payload.keys())
         placeholders = ", ".join(["?"] * len(payload))
         with self._connect() as conn:
+            # A pending run represents the latest missed opportunity while an
+            # agent is busy. Replaying every historical occurrence creates a
+            # burst of obsolete prompts after recovery.
+            conn.execute("DELETE FROM pending_runs WHERE task_id = ?", (pending.task_id,))
             conn.execute(
                 f"INSERT INTO pending_runs ({columns}) VALUES ({placeholders})",
                 list(payload.values()),
             )
+
+    async def cleanup_pending(self, *, max_age: timedelta = _PENDING_RUN_MAX_AGE) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(self._cleanup_pending_sync, max_age)
+
+    def _cleanup_pending_sync(self, max_age: timedelta) -> int:
+        cutoff = _iso_utc(_now_utc() - max_age)
+        with self._connect() as conn:
+            before = conn.execute("SELECT COUNT(*) FROM pending_runs").fetchone()[0]
+            conn.execute(
+                """
+                DELETE FROM pending_runs
+                WHERE enqueued_at < ?
+                   OR NOT EXISTS (
+                       SELECT 1 FROM tasks
+                       WHERE tasks.id = pending_runs.task_id
+                         AND tasks.enabled = 1
+                   )
+                """,
+                (cutoff,),
+            )
+
+            rows = conn.execute(
+                """
+                SELECT id, task_id
+                FROM pending_runs
+                ORDER BY task_id ASC, enqueued_at DESC, id DESC
+                """
+            ).fetchall()
+            seen_task_ids: set[str] = set()
+            duplicate_ids: list[str] = []
+            for row in rows:
+                if row["task_id"] in seen_task_ids:
+                    duplicate_ids.append(row["id"])
+                else:
+                    seen_task_ids.add(row["task_id"])
+            if duplicate_ids:
+                conn.executemany("DELETE FROM pending_runs WHERE id = ?", [(value,) for value in duplicate_ids])
+
+            after = conn.execute("SELECT COUNT(*) FROM pending_runs").fetchone()[0]
+        return before - after
 
     async def pop_pending_for_cwd(self, cwd: str) -> PendingRun | None:
         async with self._lock:
@@ -1295,6 +1360,9 @@ class TaskScheduler:
         async with self._lock:
             if self._started:
                 return
+            discarded = await self._store.cleanup_pending()
+            if discarded:
+                logger.warning("Discarded %s stale or duplicate pending task run(s)", discarded)
             self._scheduler.start()
             await self.reload()
             self._started = True

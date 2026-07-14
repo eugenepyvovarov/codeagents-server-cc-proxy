@@ -68,6 +68,36 @@ async def test_health_uses_basic_auth_when_password_configured():
 
 
 @pytest.mark.asyncio
+async def test_client_reloads_rotated_environment_credentials_after_401(tmp_path: Path):
+    env_path = tmp_path / "opencode.env"
+    env_path.write_text(
+        "OPENCODE_SERVER_USERNAME=opencode\nOPENCODE_SERVER_PASSWORD=old-password\n",
+        encoding="utf-8",
+    )
+    authorizations: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        authorizations.append(request.headers.get("authorization"))
+        if len(authorizations) == 1:
+            return httpx.Response(401, json={"error": "unauthorized"})
+        return httpx.Response(200, json={"healthy": True, "version": "rotated"})
+
+    client = OpenCodeClient.from_environment(
+        env={},
+        env_file_paths=(env_path,),
+        transport=httpx.MockTransport(handler),
+    )
+    env_path.write_text(
+        "OPENCODE_SERVER_USERNAME=opencode\nOPENCODE_SERVER_PASSWORD=new-password\n",
+        encoding="utf-8",
+    )
+
+    assert await client.health_status() == {"healthy": True, "version": "rotated"}
+    assert len(authorizations) == 2
+    assert authorizations[0] != authorizations[1]
+
+
+@pytest.mark.asyncio
 async def test_health_status_reports_unavailable_on_error():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={"error": "not ready"})

@@ -126,6 +126,7 @@ async def test_session_endpoints_include_directory_and_encode_session_id():
         if raw_path == "/session/ses%2Ffixture/prompt_async":
             assert request.url.params["directory"] == "/tmp/project"
             assert json.loads(request.content.decode("utf-8")) == {
+                "messageID": "msg_fixture",
                 "parts": [{"type": "text", "text": "hello"}]
             }
             return httpx.Response(200)
@@ -139,7 +140,12 @@ async def test_session_endpoints_include_directory_and_encode_session_id():
 
     assert await client.create_session(title="Fixture", directory="/tmp/project") == {"id": "ses_fixture"}
     assert await client.session_status(directory="/tmp/project") == {"ses_fixture": {"type": "idle"}}
-    await client.prompt_async(session_id="ses/fixture", prompt="hello", directory="/tmp/project")
+    await client.prompt_async(
+        session_id="ses/fixture",
+        prompt="hello",
+        directory="/tmp/project",
+        message_id="msg_fixture",
+    )
     assert await client.session_messages(session_id="ses/fixture", directory="/tmp/project", limit=10) == []
     assert [request.method for request in requests] == ["POST", "GET", "POST", "GET"]
 

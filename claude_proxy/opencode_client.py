@@ -235,11 +235,21 @@ class OpenCodeClient:
             raise ValueError("OpenCode session status response must be an object")
         return response
 
-    async def prompt_async(self, *, session_id: str, prompt: str, directory: str | None = None) -> None:
+    async def prompt_async(
+        self,
+        *,
+        session_id: str,
+        prompt: str,
+        directory: str | None = None,
+        message_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"parts": [{"type": "text", "text": prompt}]}
+        if message_id:
+            payload["messageID"] = message_id
         await self.request(
             "POST",
             f"/session/{quote(session_id, safe='')}/prompt_async",
-            json={"parts": [{"type": "text", "text": prompt}]},
+            json=payload,
             params={"directory": directory} if directory else None,
         )
 

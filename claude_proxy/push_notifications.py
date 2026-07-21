@@ -72,6 +72,7 @@ async def trigger_reply_finished(
     conversation_id: str | None = None,
     message_preview: str | None = None,
     renderable_assistant_count: int | None = None,
+    assistant_message_cursor: int | None = None,
 ) -> None:
     secret = _env("CODEAGENTS_PUSH_SECRET")
     base_url = _env("CODEAGENTS_PUSH_GATEWAY_BASE_URL")
@@ -93,6 +94,10 @@ async def trigger_reply_finished(
         payload["conversation_id"] = conversation_id
     if renderable_assistant_count is not None:
         payload["renderable_assistant_count"] = renderable_assistant_count
+    if assistant_message_cursor is not None:
+        # v2 cursor unit: unique finalized, renderable OpenCode assistant messages.
+        payload["assistant_message_cursor"] = assistant_message_cursor
+        payload["cursor_version"] = 2
     if message_preview:
         normalized = _normalize_preview(message_preview)
         if normalized:

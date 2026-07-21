@@ -47,6 +47,7 @@ async def test_trigger_reply_finished_posts_to_mocked_gateway(monkeypatch: pytes
         conversation_id="ses_fixture",
         message_preview=" scheduled\n\n task   complete ",
         renderable_assistant_count=3,
+        assistant_message_cursor=2,
     )
 
     thread.join(timeout=2)
@@ -60,7 +61,31 @@ async def test_trigger_reply_finished_posts_to_mocked_gateway(monkeypatch: pytes
             "cwd": "/tmp/project",
             "conversation_id": "ses_fixture",
             "renderable_assistant_count": 3,
+            "assistant_message_cursor": 2,
+            "cursor_version": 2,
             "message_preview": "scheduled task complete",
             "include_preview": True,
         },
+    }
+
+
+@pytest.mark.asyncio
+async def test_trigger_reply_finished_omits_v2_marker_without_v2_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_post_json(url: str, *, secret: str, payload: dict[str, Any]) -> dict[str, Any]:
+        captured.update({"url": url, "secret": secret, "payload": payload})
+        return {"ok": True}
+
+    monkeypatch.setenv("CODEAGENTS_PUSH_SECRET", "push-secret")
+    monkeypatch.setenv("CODEAGENTS_PUSH_GATEWAY_BASE_URL", "https://push.example")
+    monkeypatch.setattr("claude_proxy.push_notifications._post_json", fake_post_json)
+
+    await trigger_reply_finished(cwd="/tmp/project", renderable_assistant_count=3)
+
+    assert captured["payload"] == {
+        "cwd": "/tmp/project",
+        "renderable_assistant_count": 3,
     }

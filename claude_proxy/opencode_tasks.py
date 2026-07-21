@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from typing import Any
 
 import httpx
@@ -16,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 # Real OpenCode ids look like ses_<long token>. Reject placeholders (e.g. ses_diag).
 _OPENCODE_SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]{12,}$")
+_RECENT_MESSAGE_LIMIT = 100
+_SYNTHETIC_TOOL_NARRATION_RE = re.compile(
+    r"^\s*Called the \S+ tool with the following input\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _new_task_message_id() -> str:
+    return f"msg_{uuid.uuid4().hex}"
 
 
 class OpenCodeTaskRunner:
@@ -72,13 +82,18 @@ class OpenCodeTaskRunner:
             if await self._is_session_busy(session_id=session_id, cwd=cwd):
                 return False
 
+            task_message_id = _new_task_message_id()
             try:
-                await self._client.prompt_async(session_id=session_id, prompt=prompt, directory=cwd)
+                await self._client.session_messages(
+                    session_id=session_id,
+                    directory=cwd,
+                    limit=_RECENT_MESSAGE_LIMIT,
+                )
             except httpx.HTTPStatusError as exc:
-                if exc.response is None or exc.response.status_code != 404:
+                if not _is_not_found(exc):
                     raise
                 logger.warning(
-                    "OpenCode session %s missing (404); clearing pin and recreating for cwd=%s",
+                    "OpenCode session %s missing during baseline fetch (404); recreating for cwd=%s",
                     session_id,
                     cwd,
                 )
@@ -88,10 +103,55 @@ class OpenCodeTaskRunner:
                     request_body=request_body,
                     dead_session_id=session_id,
                 )
-                await self._client.prompt_async(session_id=session_id, prompt=prompt, directory=cwd)
+                await self._client.session_messages(
+                    session_id=session_id,
+                    directory=cwd,
+                    limit=_RECENT_MESSAGE_LIMIT,
+                )
 
-            await self._wait_until_idle(session_id=session_id, cwd=cwd)
-            await self._trigger_push_if_configured(session_id=session_id, cwd=cwd)
+            try:
+                await self._client.prompt_async(
+                    session_id=session_id,
+                    prompt=prompt,
+                    directory=cwd,
+                    message_id=task_message_id,
+                )
+            except httpx.HTTPStatusError as exc:
+                if not _is_not_found(exc):
+                    raise
+                logger.warning(
+                    "OpenCode session %s missing during prompt (404); recreating for cwd=%s",
+                    session_id,
+                    cwd,
+                )
+                session_id = await self._recreate_session_after_missing(
+                    conversation_id=conversation_id,
+                    cwd=cwd,
+                    request_body=request_body,
+                    dead_session_id=session_id,
+                )
+                await self._client.session_messages(
+                    session_id=session_id,
+                    directory=cwd,
+                    limit=_RECENT_MESSAGE_LIMIT,
+                )
+                await self._client.prompt_async(
+                    session_id=session_id,
+                    prompt=prompt,
+                    directory=cwd,
+                    message_id=task_message_id,
+                )
+
+            await self._wait_for_correlated_assistant_and_idle(
+                session_id=session_id,
+                cwd=cwd,
+                task_message_id=task_message_id,
+            )
+            await self._trigger_push_if_configured(
+                session_id=session_id,
+                cwd=cwd,
+                task_message_id=task_message_id,
+            )
             return True
         finally:
             async with self._active_lock:
@@ -274,29 +334,78 @@ class OpenCodeTaskRunner:
         statuses = await self._client.session_status(directory=cwd)
         return _status_type(statuses.get(session_id)) in {"busy", "running", "retry", "retrying"}
 
-    async def _wait_until_idle(self, *, session_id: str, cwd: str) -> None:
+    async def _wait_for_correlated_assistant_and_idle(
+        self,
+        *,
+        session_id: str,
+        cwd: str,
+        task_message_id: str,
+    ) -> None:
         deadline = asyncio.get_running_loop().time() + self._max_wait_seconds
 
         while True:
+            # Take the message snapshot first. An idle status sampled before the
+            # snapshot can belong to the pre-prompt state and must not complete a task.
+            messages = await self._client.session_messages(
+                session_id=session_id,
+                directory=cwd,
+                limit=_RECENT_MESSAGE_LIMIT,
+            )
+            if _has_correlated_assistant_error(messages, parent_message_id=task_message_id):
+                raise RuntimeError(f"OpenCode assistant reply for task {task_message_id} failed.")
+            has_correlated_assistant = bool(
+                finalized_renderable_open_code_assistant_message_ids(
+                    messages,
+                    parent_message_id=task_message_id,
+                )
+            )
+
             statuses = await self._client.session_status(directory=cwd)
             status_type = _status_type(statuses.get(session_id))
-            if status_type in {None, "idle"}:
-                return
             if status_type == "error":
                 raise RuntimeError(f"OpenCode session {session_id} failed.")
+            if has_correlated_assistant and status_type in {None, "idle"}:
+                return
             if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError(f"OpenCode session {session_id} did not become idle.")
+                raise TimeoutError(
+                    f"OpenCode session {session_id} did not produce its finalized assistant reply and become idle."
+                )
             await asyncio.sleep(self._poll_interval_seconds)
 
-    async def _trigger_push_if_configured(self, *, session_id: str, cwd: str) -> None:
+    async def _trigger_push_if_configured(
+        self,
+        *,
+        session_id: str,
+        cwd: str,
+        task_message_id: str | None = None,
+    ) -> None:
         try:
-            messages = await self._client.session_messages(session_id=session_id, directory=cwd, limit=100)
-            preview, renderable_count = summarize_open_code_messages(messages)
+            # Refresh after the idle confirmation. The snapshot used to decide
+            # completion was captured before the status sample and may be stale.
+            recent_messages = await self._client.session_messages(
+                session_id=session_id,
+                directory=cwd,
+                limit=_RECENT_MESSAGE_LIMIT,
+            )
+            preview, legacy_renderable_count, _ = summarize_open_code_messages(
+                recent_messages,
+                parent_message_id=task_message_id,
+            )
+            # The old part-based cursor was always a bounded recent snapshot.
+            # Fetch the full session only once, after exact completion + idle,
+            # to produce the v2 absolute finalized-assistant cursor.
+            full_messages = await self._client.session_messages(
+                session_id=session_id,
+                directory=cwd,
+                limit=None,
+            )
+            _, _, assistant_message_cursor = summarize_open_code_messages(full_messages)
             await trigger_reply_finished(
                 cwd=cwd,
                 conversation_id=session_id,
                 message_preview=preview,
-                renderable_assistant_count=renderable_count,
+                renderable_assistant_count=legacy_renderable_count,
+                assistant_message_cursor=assistant_message_cursor,
             )
         except Exception:
             logger.exception("Failed to trigger OpenCode scheduled task push")
@@ -326,8 +435,17 @@ def _status_type(value: Any) -> str | None:
     return None
 
 
-def summarize_open_code_messages(messages: list[Any]) -> tuple[str | None, int]:
-    renderable_count = 0
+def _is_not_found(exc: httpx.HTTPStatusError) -> bool:
+    return exc.response is not None and exc.response.status_code == 404
+
+
+def summarize_open_code_messages(
+    messages: list[Any],
+    *,
+    parent_message_id: str | None = None,
+) -> tuple[str | None, int, int]:
+    legacy_renderable_count = _legacy_renderable_assistant_count(messages)
+    assistant_message_ids: set[str] = set()
     last_text: str | None = None
 
     for message in messages:
@@ -337,11 +455,77 @@ def summarize_open_code_messages(messages: list[Any]) -> tuple[str | None, int]:
         role = info.get("role") if isinstance(info, dict) else None
         if role != "assistant":
             continue
+        if not _has_completed_time(info):
+            continue
+        message_id = info.get("id") if isinstance(info, dict) else None
+        if not isinstance(message_id, str) or not message_id.strip():
+            continue
+        message_id = message_id.strip()
 
+        rendered_text = _rendered_open_code_text(message.get("parts"))
+        if rendered_text:
+            assistant_message_ids.add(message_id)
+            if parent_message_id is None or info.get("parentID") == parent_message_id:
+                last_text = rendered_text
+
+    return last_text, legacy_renderable_count, len(assistant_message_ids)
+
+
+def finalized_renderable_open_code_assistant_message_ids(
+    messages: list[Any],
+    *,
+    parent_message_id: str | None = None,
+) -> set[str]:
+    ids: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info")
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        if not _has_completed_time(info):
+            continue
+        if parent_message_id is not None and info.get("parentID") != parent_message_id:
+            continue
+        message_id = info.get("id")
+        if not isinstance(message_id, str) or not message_id.strip():
+            continue
+        if _rendered_open_code_text(message.get("parts")):
+            ids.add(message_id.strip())
+    return ids
+
+
+def _has_correlated_assistant_error(messages: list[Any], *, parent_message_id: str) -> bool:
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info")
+        if not isinstance(info, dict):
+            continue
+        if info.get("role") != "assistant" or info.get("parentID") != parent_message_id:
+            continue
+        if info.get("error") is not None:
+            return True
+    return False
+
+
+def _has_completed_time(info: dict[str, Any]) -> bool:
+    time = info.get("time")
+    return isinstance(time, dict) and time.get("completed") is not None
+
+
+def _legacy_renderable_assistant_count(messages: list[Any]) -> int:
+    """Preserve the pre-v2 bubble/part cursor for installed app versions."""
+    renderable_count = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info")
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
         parts = message.get("parts")
         if not isinstance(parts, list):
             continue
-
         for part in parts:
             if not isinstance(part, dict):
                 continue
@@ -350,7 +534,6 @@ def summarize_open_code_messages(messages: list[Any]) -> tuple[str | None, int]:
                 text = part.get("text")
                 if isinstance(text, str) and text.strip():
                     renderable_count += 1
-                    last_text = text
             elif part_type in {
                 "tool",
                 "file",
@@ -362,5 +545,27 @@ def summarize_open_code_messages(messages: list[Any]) -> tuple[str | None, int]:
                 "compaction",
             }:
                 renderable_count += 1
+    return renderable_count
 
-    return last_text, renderable_count
+
+def _rendered_open_code_text(parts: Any) -> str | None:
+    if not isinstance(parts, list):
+        return None
+    rendered: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        if part.get("synthetic") is True or part.get("ignored") is True:
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            continue
+        if _SYNTHETIC_TOOL_NARRATION_RE.search(text):
+            # OpenCode may omit the synthetic flag. Discard the whole generated
+            # narration part so nested tool input is never previewed as a reply.
+            continue
+        cleaned = text.strip()
+        if cleaned:
+            rendered.append(cleaned)
+    combined = "\n".join(rendered).strip()
+    return combined or None
